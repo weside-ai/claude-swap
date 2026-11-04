@@ -397,6 +397,37 @@ service-account keys scoped to a single workspace: a multi-workspace key needs a
 `anthropic-workspace-id` header on every request, which Claude Code does not add for
 a stored key.
 
+### Linked session profiles (Linux, opt-in)
+
+`CSWAP_LINKED_PROFILES=1` lets an account run as a pinned `cswap run` session
+**and** be the default login at the same time, without the two copies
+consuming each other's refresh token:
+
+- **Switch.** A switch to an account whose profile is live adopts the
+  profile's newer generation into the backup under the profile's own Claude
+  Code credential locks, then activates it. Without the flag that switch is
+  refused ("rotated past the stored backup").
+- **One refresher.** Each pass, cswap compares the default login and the
+  live profile under both lock pairs. The same generation is refreshed by
+  cswap 10 minutes before expiry (ahead of Claude Code's own 5-minute window)
+  and written to both stores and the backup. A later generation in one copy
+  (by `expiresAt`) is copied over the other; a wiped copy is restored. Only
+  `claudeAiOauth` moves; `mcpOAuth` and other fields stay in their own store.
+- **Loud on divergence.** Two different generations with no later one, both
+  copies wiped, or a failed refresh write nothing and raise an alert on every
+  pass: error log, stderr and `<data>/linked-alert-<n>.json` (12-character
+  hashes only).
+- **Shared session registry.** If a wrapper symlinks a profile's `sessions/`
+  to `~/.claude/sessions` (so default-login sessions and profile sessions can
+  message each other), the profile counts only the pids recorded by
+  `cswap run` in `<profile>/.cswap-run-pids` and their descendants. Without
+  that marker every record still counts, so restart pinned sessions once
+  after installing before turning the flag on.
+
+Claude Code replaces `.credentials.json` with `rename` on every write, so the
+two stores cannot be one symlinked file; they are two files kept on one
+generation.
+
 ## Uninstall
 
 Remove all data:

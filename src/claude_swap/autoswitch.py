@@ -41,6 +41,7 @@ import json
 import logging
 import math
 import random
+import sys
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -811,6 +812,14 @@ class AutoSwitchEngine:
         if self.switcher.account_kind_for(number) == "api_key":
             return "ok"  # API keys don't expire/refresh
         if self.switcher.live_session_pids_for(number, email):
+            from claude_swap.linked import linked_profiles_enabled
+
+            if linked_profiles_enabled() and sys.platform.startswith("linux"):
+                # Linked mode: the profile holds the freshest generation and
+                # the switch adopts it under the profile's locks; refreshing
+                # the backup here would consume a generation the profile
+                # already rotated past. sync_linked_profile freshens after.
+                return "ok"
             # A live `cswap run` session owns this account's token in its own
             # profile. Auto-activating it as the default login too would put
             # one rotating refresh token in two config dirs (the stale-copy

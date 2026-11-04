@@ -4282,6 +4282,21 @@ class ClaudeAccountSwitcher:
             current_email, current_org_uuid = current_identity
             active_num = self._find_account_slot(data, current_email, current_org_uuid)
 
+        if active_num is not None:
+            from claude_swap.linked import linked_profiles_enabled, sync_linked_profile
+
+            if linked_profiles_enabled():
+                active = data.get("accounts", {}).get(str(active_num), {})
+                try:
+                    sync_linked_profile(
+                        self,
+                        str(active_num),
+                        active.get("email", ""),
+                        active.get("organizationUuid", "") or "",
+                    )
+                except Exception:
+                    self._logger.exception("Linked profile sync failed")
+
         accounts_info: list[tuple[int, str, str, str, bool, str, str]] = []
         # Reset each build; set below only when the active slot's OAuth Keychain
         # read failed with no fallback. Read by _static_usage_sentinel (main
@@ -7005,11 +7020,24 @@ class ClaudeAccountSwitcher:
         # first, and the switch activates the live generation. An adoption
         # that cannot be decided while the profile is ahead refuses likewise:
         # the backup is a consumed generation either way.
+        from claude_swap.linked import adopt_linked_profile, linked_profiles_enabled
+
         pre_data = self._get_sequence_data() or {}
         pre_account = pre_data.get("accounts", {}).get(target_account, {})
         pre_email = pre_account.get("email", "")
-        if pre_email:
-            pre_org = pre_account.get("organizationUuid", "") or ""
+        pre_org = pre_account.get("organizationUuid", "") or ""
+        # Linked mode: a live profile ahead of the backup is adopted under
+        # its own credential locks INSIDE the switch's lock block below, so
+        # the profile's Claude cannot rotate between adoption and
+        # activation; both stores then hold one generation, and
+        # sync_linked_profile keeps it that way.
+        linked_adopt = False
+        if pre_email and linked_profiles_enabled() and sys.platform.startswith("linux"):
+            sessions, unreadable = scan_live_sessions(
+                self._session_dir(target_account, pre_email)
+            )
+            linked_adopt = bool(sessions) and not unreadable
+        if pre_email and not linked_adopt:
             sessions, unreadable = scan_live_sessions(
                 self._session_dir(target_account, pre_email)
             )
@@ -7091,6 +7119,8 @@ class ClaudeAccountSwitcher:
         # interleaving with Claude Code's own config writes. Everything under
         # here is local I/O — no network while locks are held.
         with FileLock(self.lock_file), claude_credentials_lock(), claude_config_lock():
+            if linked_adopt:
+                adopt_linked_profile(self, target_account, pre_email, pre_org)
             data = self._get_sequence_data()
             active_account = data.get("activeAccountNumber")
             current_account = str(active_account) if active_account is not None else None

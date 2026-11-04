@@ -511,7 +511,10 @@ def scan_live_sessions(session_dir: Path) -> tuple[list[ClaudeSession], int]:
     """
     if not session_dir.exists():
         return [], 0
-    return scan_sessions(claude_dir=session_dir)
+    from claude_swap.linked import owned_sessions
+
+    sessions, unreadable = scan_sessions(claude_dir=session_dir)
+    return owned_sessions(session_dir, sessions), unreadable
 
 
 def profile_is_quiescent(session_dir: Path) -> bool:
@@ -643,6 +646,12 @@ class SessionManager:
             k: v for k, v in os.environ.items() if k not in AUTH_OVERRIDE_ENV_VARS
         }
         env["CLAUDE_CONFIG_DIR"] = str(session_dir)
+        # The pid survives execvpe: recorded here, it is the claude's pid
+        # (linked.py, shared session registry). Written unconditionally so
+        # the marker exists before linked mode is switched on.
+        from claude_swap.linked import record_run_pid
+
+        record_run_pid(session_dir)
         self._exec(claude_bin, claude_args, env=env)
 
     def exec_default(self, claude_args: list[str]) -> NoReturn:
