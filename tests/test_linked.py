@@ -175,7 +175,21 @@ class TestSharedRegistryFilter:
 
         assert linked.read_run_pids(profile) == {}
         sessions, _ = scan_live_sessions(profile)
-        assert sessions == []
+        assert [s.pid for s in sessions] == [foreign.pid]  # no live run: unfiltered
+
+    def test_orphaned_child_without_live_root_still_counts(self, shared_profile, procs, linked_on):
+        """claude rc exits, its session survives: never read as quiescent."""
+        profile, registry = shared_profile
+        owner = procs(["sh", "-c", "sleep 60 & wait"])
+        kid = child_pid(owner.pid)
+        write_record(registry, kid)
+        linked.record_run_pid(profile, owner.pid)
+        owner.kill()
+        owner.wait()
+
+        sessions, _ = scan_live_sessions(profile)
+
+        assert kid in {s.pid for s in sessions}
 
     def test_own_registry_is_untouched(self, tmp_path, procs, linked_on):
         profile = tmp_path / "profile"
@@ -258,37 +272,14 @@ def make_global(home: Path, email: str, org: str, raw: str) -> None:
 
 
 class TestKonto4InactiveRefresh:
-    """0.29.0: an inactive slot whose profile shares the registry counts as
-    live forever, so its expired backup is never refreshed (sentinel
-    "token expired — refresh deferred this pass")."""
+    """An abandoned pin profile with a shared registry and no live run keeps
+    counting every Claude on the machine, flag or not (the conservative
+    filter): its expired backup is never refreshed. The fix for that slot is
+    removing the profile, not the filter."""
 
-    def test_inactive_slot_takes_refresh_path(self, switcher, temp_home, procs, linked_on, monkeypatch):
-        foreign = procs(["sleep", "60"])
-        profile = session_dir_for(switcher.backup_dir, NUM, EMAIL)
-        profile.mkdir(parents=True)
-        registry = temp_home / ".claude" / "sessions"
-        registry.mkdir(parents=True)
-        (profile / "sessions").symlink_to(registry)
-        write_record(registry, foreign.pid)  # some unrelated claude
-        (profile / linked.RUN_PIDS_FILE).write_text("")  # profile not running
-        expired = creds("old", now_ms() - HOUR_MS)
-        switcher._write_account_credentials(NUM, EMAIL, expired)
-
-        calls = []
-
-        def fake_fetch(num, email, c, is_active, refresh_via=None, **kw):
-            calls.append(refresh_via)
-            return oauth.UsageOutcome(usage={"ok": True})
-
-        monkeypatch.setattr(oauth, "try_fetch_usage_for_account", fake_fetch)
-
-        rec = switcher._fetch_account_usage((int(NUM), EMAIL, "M", ORG, False, expired, ""))
-
-        assert rec.sentinel != USAGE_TOKEN_EXPIRED
-        assert calls and calls[0] is not None  # consume_backup_grant offered
-
-    def test_red_arm_without_flag_defers(self, switcher, temp_home, procs, monkeypatch):
-        monkeypatch.delenv(linked.ENV_FLAG, raising=False)
+    @pytest.mark.parametrize("flag", ["", "1"])
+    def test_abandoned_shared_profile_defers(self, switcher, temp_home, procs, monkeypatch, flag):
+        monkeypatch.setenv(linked.ENV_FLAG, flag)
         foreign = procs(["sleep", "60"])
         profile = session_dir_for(switcher.backup_dir, NUM, EMAIL)
         profile.mkdir(parents=True)
@@ -307,6 +298,22 @@ class TestKonto4InactiveRefresh:
         rec = switcher._fetch_account_usage((int(NUM), EMAIL, "M", ORG, False, expired, ""))
 
         assert rec.sentinel == USAGE_TOKEN_EXPIRED
+
+    def test_removed_profile_takes_refresh_path(self, switcher, temp_home, procs, linked_on, monkeypatch):
+        expired = creds("old", now_ms() - HOUR_MS)
+        switcher._write_account_credentials(NUM, EMAIL, expired)
+        calls = []
+
+        def fake_fetch(num, email, c, is_active, refresh_via=None, **kw):
+            calls.append(refresh_via)
+            return oauth.UsageOutcome(usage={"ok": True})
+
+        monkeypatch.setattr(oauth, "try_fetch_usage_for_account", fake_fetch)
+
+        rec = switcher._fetch_account_usage((int(NUM), EMAIL, "M", ORG, False, expired, ""))
+
+        assert rec.sentinel != USAGE_TOKEN_EXPIRED
+        assert calls and calls[0] is not None
 
 
 class TestSwitchToLinked:
@@ -328,6 +335,36 @@ class TestSwitchToLinked:
         assert gen(switcher.read_account_credentials(NUM, EMAIL)) == gen(profile_raw)
         assert (profile / ".credentials.json").read_text() == profile_raw
         assert "profile-only" not in g  # store-local fields stay local
+
+    def test_profile_locks_held_through_activation(self, switcher, temp_home, procs, linked_on, monkeypatch):
+        switcher._write_account_credentials(NUM, EMAIL, creds("consumed", now_ms() - HOUR_MS))
+        profile = make_profile(switcher, temp_home, procs, creds("live", now_ms() + 3 * HOUR_MS))
+        make_global(temp_home, OTHER_EMAIL, "org-o", creds("other", now_ms() + 5 * HOUR_MS))
+        monkeypatch.setattr(switcher, "list_accounts", lambda **kw: None)
+        monkeypatch.setattr(switcher, "_prefetch_live_identity", lambda: {"live": None, "resolved": None})
+        seen = []
+        real = switcher._write_credentials
+
+        def spy(raw):
+            seen.append(oauth_refresh_lock_dir(profile).is_dir() and credentials_lock_dir(profile).is_dir())
+            real(raw)
+
+        monkeypatch.setattr(switcher, "_write_credentials", spy)
+
+        switcher._perform_switch(NUM)
+
+        assert seen and all(seen)
+
+    def test_unadoptable_profile_refuses(self, switcher, temp_home, procs, linked_on, monkeypatch):
+        switcher._write_account_credentials(NUM, EMAIL, creds("consumed", now_ms() - HOUR_MS))
+        profile = make_profile(switcher, temp_home, procs, creds("live", now_ms() + 3 * HOUR_MS))
+        (profile / ".claude.json").write_text("{broken")
+        make_global(temp_home, OTHER_EMAIL, "org-o", creds("other", now_ms() + 5 * HOUR_MS))
+        monkeypatch.setattr(switcher, "_prefetch_live_identity", lambda: {"live": None, "resolved": None})
+
+        with pytest.raises(SwitchError, match="could not be adopted"):
+            switcher._perform_switch(NUM)
+        assert "at-other" in global_creds_path(temp_home).read_text()
 
     def test_red_arm_without_flag_refuses(self, switcher, temp_home, procs, monkeypatch):
         monkeypatch.delenv(linked.ENV_FLAG, raising=False)
@@ -480,3 +517,55 @@ class TestSyncLinked:
         monkeypatch.setattr(oauth, "try_refresh_oauth_credentials",
                             lambda c: oauth.RefreshOutcome(None, "invalid_grant"))
         assert self.sync(switcher) == linked.DIVERGED
+
+    def test_unparseable_store_defers_and_keeps_fields(self, switcher, temp_home, linked_pair):
+        good = creds("a", now_ms() + HOUR_MS)
+        linked_pair(good, good)
+        global_creds_path(temp_home).write_text('{"claudeAiOauth": {"acc')  # mid-write
+        assert self.sync(switcher) == linked.DEFERRED
+        assert global_creds_path(temp_home).read_text() == '{"claudeAiOauth": {"acc'
+
+    def test_unreadable_profile_identity_alerts(self, switcher, temp_home, linked_pair):
+        old, new = creds("a", now_ms() + HOUR_MS), creds("b", now_ms() + 8 * HOUR_MS)
+        profile = linked_pair(old, new)
+        (profile / ".claude.json").write_text("{broken")
+        assert self.sync(switcher) == linked.DIVERGED
+        assert global_creds_path(temp_home).read_text() == old
+
+    def test_backup_witness_wins_after_failed_store_writes(self, switcher, temp_home, linked_pair):
+        consumed = creds("a", now_ms() + 60 * 1000)
+        fresh = creds("b", now_ms() + 8 * HOUR_MS)
+        profile = linked_pair(consumed, consumed, backup=fresh)
+        assert self.sync(switcher) == linked.FROM_BACKUP
+        assert gen(global_creds_path(temp_home).read_text()) == gen(fresh)
+        assert gen((profile / ".credentials.json").read_text()) == gen(fresh)
+
+    def test_freshen_write_failure_alerts_and_next_pass_converges(
+        self, switcher, temp_home, linked_pair, monkeypatch, capsys
+    ):
+        raw = creds("a", now_ms() + 60 * 1000)
+        profile = linked_pair(raw, raw)
+        fresh = creds("b", now_ms() + 8 * HOUR_MS)
+        posts = []
+
+        def fake_refresh(c):
+            posts.append(c)
+            return oauth.RefreshOutcome(fresh, None)
+
+        monkeypatch.setattr(oauth, "try_refresh_oauth_credentials", fake_refresh)
+
+        def boom(raw):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(switcher, "_write_credentials", boom)
+        monkeypatch.setattr(linked, "_write_profile", lambda d, r: boom(r))
+
+        assert self.sync(switcher) == linked.FRESHENED
+        assert "write failed" in capsys.readouterr().err
+        monkeypatch.undo()
+        monkeypatch.setenv(linked.ENV_FLAG, "1")
+
+        assert self.sync(switcher) == linked.FROM_BACKUP
+        assert len(posts) == 1  # the consumed generation is never POSTed again
+        assert gen(global_creds_path(temp_home).read_text()) == gen(fresh)
+        assert gen((profile / ".credentials.json").read_text()) == gen(fresh)

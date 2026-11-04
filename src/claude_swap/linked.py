@@ -13,9 +13,12 @@ marks it stale, and an inactive slot with such a profile is never refreshed.
 same across ``execvpe``) in ``<profile>/.cswap-run-pids`` together with its
 ``/proc`` start ticks. With the registry shared, only records whose pid is a
 recorded run pid -- or a descendant of one, since ``claude rc`` spawns its
-sessions as children -- count for the profile. Without a readable marker the
-filter does nothing: a profile whose live instance predates the marker must
-never read as quiescent.
+sessions as children -- count for the profile, and only while at least one
+recorded run is alive. Without a live recorded run the filter does nothing:
+an instance that predates the marker, or a child orphaned by its root, must
+never read as quiescent. Residual gap, documented rather than closed: while a
+recorded run lives, an instance started against the profile without
+``cswap run`` (or a child orphaned from an earlier root) is not counted.
 
 Linked active slot. When the account that is the default login also has a
 live profile, the two stores hold the same generation and cswap is the one
@@ -134,7 +137,11 @@ def owned_sessions(
     if not Path("/proc/self/stat").exists():
         return sessions
     roots = read_run_pids(session_dir)
-    if roots is None:
+    if not roots:
+        # No marker, an unreadable one, or every recorded run is gone: a
+        # live instance may predate the marker or have been orphaned by its
+        # root (``claude rc`` exiting under surviving children). Not knowing
+        # whose a record is must never read as "nobody there".
         return sessions
     return [s for s in sessions if descends_from(s.pid, set(roots))]
 
@@ -156,6 +163,7 @@ TO_PROFILE = "copied-to-profile"
 TO_GLOBAL = "copied-to-global"
 DEFERRED = "deferred"
 DIVERGED = "diverged"
+FROM_BACKUP = "restored-from-backup"
 
 
 def _oauth(credentials: str | None) -> dict | None:
@@ -204,6 +212,27 @@ def with_oauth(credentials: str | None, data: dict) -> str:
         doc = {}
     doc["claudeAiOauth"] = data
     return json.dumps(doc, separators=(",", ":"))
+
+
+def _parses(raw: str | None) -> bool:
+    """Absent, or a JSON object. Anything else is a read in progress or a
+    broken file: never something to overwrite or to judge a generation by."""
+    import json
+
+    if not raw:
+        return True
+    try:
+        return isinstance(json.loads(raw), dict)
+    except (ValueError, TypeError):
+        return False
+
+
+def _profile_is_account(session_dir: Path, email: str, org_uuid: str) -> bool:
+    """Positive evidence the profile is logged in as this slot: a write path
+    must not read an unreadable identity as "not drift"."""
+    from claude_swap.session import read_session_identity
+
+    return read_session_identity(session_dir) == (email, org_uuid or "")
 
 
 def _alert_path(switcher, account_num: str) -> Path:
@@ -274,11 +303,7 @@ def sync_linked_profile(switcher, account_num: str, email: str, org_uuid: str) -
     from claude_swap.claude_locks import claude_credentials_lock
     from claude_swap.exceptions import LockError
     from claude_swap.locking import FileLock
-    from claude_swap.session import (
-        read_session_credentials,
-        scan_live_sessions,
-        session_identity_drifted,
-    )
+    from claude_swap.session import read_session_credentials, scan_live_sessions
 
     if not linked_profiles_enabled() or not sys.platform.startswith("linux"):
         return OFF
@@ -297,16 +322,44 @@ def sync_linked_profile(switcher, account_num: str, email: str, org_uuid: str) -
         ):
             if not switcher._live_identity_matches(email, org_uuid):
                 return NOT_LINKED
-            if session_identity_drifted(session_dir, email, org_uuid):
-                _raise_alert(switcher, account_num, email, "profile identity is another account")
+            if not _profile_is_account(session_dir, email, org_uuid):
+                _raise_alert(
+                    switcher, account_num, email,
+                    "profile identity is unreadable or another account",
+                )
                 return DIVERGED
             g_raw = switcher._read_credentials()
             p_raw = read_session_credentials(session_dir)
-            if g_raw is None:
+            b_raw, b_unreadable = switcher._read_account_credentials_ex(account_num, email)
+            if g_raw is None or b_unreadable:
                 return DEFERRED
-            g, p = _oauth(g_raw), _oauth(p_raw)
+            if not (_parses(g_raw) and _parses(p_raw) and _parses(b_raw)):
+                switcher._logger.warning(
+                    "Linked Account-%s: a credential store does not parse; "
+                    "sync deferred, nothing written", account_num,
+                )
+                return DEFERRED
+            g, p, b = _oauth(g_raw), _oauth(p_raw), _oauth(b_raw)
             g_id, p_id = generation_id(g), generation_id(p)
-            ids = {"global": g_id, "profile": p_id}
+            ids = {"global": g_id, "profile": p_id, "backup": generation_id(b)}
+
+            # The backup is a third witness: a freshen whose global and
+            # profile writes both failed still landed its generation there
+            # first, and must win over the consumed one in both stores.
+            if (
+                _usable(b)
+                and generation_id(b) not in (g_id, p_id)
+                and all(
+                    not _usable(x) or b["expiresAt"] > x["expiresAt"] for x in (g, p)
+                )
+            ):
+                _write_both(switcher, account_num, email, session_dir, g_raw, p_raw, b_raw, b)
+                switcher._logger.warning(
+                    "Linked Account-%s: backup generation restored into both stores %s",
+                    account_num, ids,
+                )
+                _clear_alert(switcher, account_num)
+                return FROM_BACKUP
 
             if _usable(g) and _usable(p) and g_id == p_id:
                 now_ms = int(__import__("time").time() * 1000)
@@ -323,7 +376,7 @@ def sync_linked_profile(switcher, account_num: str, email: str, org_uuid: str) -
                         f"refresh failed ({outcome.error or 'no token pair'})", **ids,
                     )
                     return DIVERGED
-                _write_both(switcher, account_num, email, session_dir, g_raw, p_raw, fresh)
+                _write_both(switcher, account_num, email, session_dir, g_raw, p_raw, b_raw, fresh)
                 switcher._logger.info(
                     "Linked Account-%s freshened: %s -> %s", account_num, g_id,
                     generation_id(fresh),
@@ -348,7 +401,7 @@ def sync_linked_profile(switcher, account_num: str, email: str, org_uuid: str) -
                 )
                 return DIVERGED
             data = g if winner == "global" else p
-            _write_both(switcher, account_num, email, session_dir, g_raw, p_raw, data)
+            _write_both(switcher, account_num, email, session_dir, g_raw, p_raw, b_raw, data)
             switcher._logger.warning(
                 "Linked Account-%s: %s generation adopted (global=%s profile=%s)",
                 account_num, winner, g_id, p_id,
@@ -359,42 +412,56 @@ def sync_linked_profile(switcher, account_num: str, email: str, org_uuid: str) -
         return DEFERRED
 
 
-def _write_both(switcher, account_num, email, session_dir, g_raw, p_raw, data) -> None:
-    g_new = with_oauth(g_raw, data)
-    p_new = with_oauth(p_raw, data)
-    if g_new != g_raw:
-        switcher._write_credentials(g_new)
-    if p_new != p_raw:
-        _write_profile(session_dir, p_new)
-    backup, unreadable = switcher._read_account_credentials_ex(account_num, email)
-    if not unreadable:
-        b_new = with_oauth(backup, data)
-        if b_new != backup:
-            # The pure store write: _post_backup_write would mark the very
-            # profile just synced stale.
-            switcher._store._write_account_credentials(account_num, email, b_new)
+def _write_both(switcher, account_num, email, session_dir, g_raw, p_raw, b_raw, data) -> None:
+    """Backup first (cswap's own store, the witness the next pass reads),
+    then the two Claude stores. Every write is attempted; any failure is
+    alerted, and the next pass converges from whichever copy holds the
+    latest generation."""
+    failed: list[str] = []
+    # The pure store write: _post_backup_write would mark the very profile
+    # just synced stale.
+    steps = (
+        ("backup", b_raw, lambda raw: switcher._store._write_account_credentials(account_num, email, raw)),
+        ("global", g_raw, switcher._write_credentials),
+        ("profile", p_raw, lambda raw: _write_profile(session_dir, raw)),
+    )
+    for name, old, write in steps:
+        new = with_oauth(old, data)
+        if new == old:
+            continue
+        try:
+            write(new)
+        except Exception as exc:  # noqa: BLE001 - each store on its own
+            failed.append(f"{name}: {type(exc).__name__}")
+    if failed:
+        _raise_alert(
+            switcher, account_num, email,
+            "write failed (" + ", ".join(failed) + "); the next pass converges "
+            "from the latest copy",
+            generation=generation_id(data),
+        )
 
 
-def adopt_linked_profile(switcher, account_num: str, email: str, org_uuid: str) -> bool:
-    """Switch-time adoption under a live profile. The caller holds cswap's
-    lock and the default login's credential locks; this takes the profile's
-    pair, so the profile's Claude cannot rotate between the adoption and the
-    activation that follows. True when the backup now holds the profile's
-    generation."""
-    from claude_swap.claude_locks import claude_credentials_lock
+def adopt_linked_profile(switcher, account_num: str, email: str, org_uuid: str) -> bool | None:
+    """Switch-time adoption under a live profile.
 
+    The caller holds cswap's lock, the default login's credential locks AND
+    the profile's pair, and keeps holding them through the activation, so
+    the profile's Claude cannot rotate in between. Tri-state like
+    ``_adopt_session_credential``: True adopted, False the profile is not
+    ahead (the backup is the generation), None ahead but not adoptable --
+    the caller must refuse, since the backup is a consumed generation."""
     session_dir = switcher._session_dir(account_num, email)
-    with claude_credentials_lock(config_home=session_dir):
-        profile = switcher._session_profile_ahead(account_num, email, org_uuid)
-        if profile is None:
-            return False
-        data = _oauth(profile)
-        if not _usable(data):
-            return False
-        backup, unreadable = switcher._read_account_credentials_ex(account_num, email)
-        if unreadable:
-            return False
-        switcher._store._write_account_credentials(account_num, email, with_oauth(backup, data))
+    profile = switcher._session_profile_ahead(account_num, email, org_uuid)
+    if profile is None:
+        return False
+    data = _oauth(profile)
+    if not _usable(data) or not _profile_is_account(session_dir, email, org_uuid):
+        return None
+    backup, unreadable = switcher._read_account_credentials_ex(account_num, email)
+    if unreadable or not _parses(backup):
+        return None
+    switcher._store._write_account_credentials(account_num, email, with_oauth(backup, data))
     switcher._logger.info(
         "Linked Account-%s: adopted live profile generation %s into the backup",
         account_num, generation_id(data),

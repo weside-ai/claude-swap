@@ -420,9 +420,16 @@ consuming each other's refresh token:
 - **Shared session registry.** If a wrapper symlinks a profile's `sessions/`
   to `~/.claude/sessions` (so default-login sessions and profile sessions can
   message each other), the profile counts only the pids recorded by
-  `cswap run` in `<profile>/.cswap-run-pids` and their descendants. Without
-  that marker every record still counts, so restart pinned sessions once
-  after installing before turning the flag on.
+  `cswap run` in `<profile>/.cswap-run-pids` and their descendants, and only
+  while at least one recorded run is alive; otherwise every record counts.
+  Restart pinned sessions once after installing, before turning the flag on:
+  while a recorded run lives, an instance started against the profile
+  without `cswap run` is not counted.
+- **Limits.** cswap is the only refresher only while accounts passes run
+  more often than every 5 minutes; a deferred pass (lock contention) or a
+  stopped daemon lets both groups of Claude processes refresh themselves
+  again, and the next pass converges from the latest copy (backup, default
+  login or profile). A successful refresh is written to the backup first.
 
 Claude Code replaces `.credentials.json` with `rename` on every write, so the
 two stores cannot be one symlinked file; they are two files kept on one

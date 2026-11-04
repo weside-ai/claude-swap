@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import json
 import logging
@@ -7118,9 +7119,27 @@ class ClaudeAccountSwitcher:
         # ~/.claude.json.lock likewise keeps the oauthAccount splice from
         # interleaving with Claude Code's own config writes. Everything under
         # here is local I/O — no network while locks are held.
-        with FileLock(self.lock_file), claude_credentials_lock(), claude_config_lock():
+        with (
+            FileLock(self.lock_file),
+            claude_credentials_lock(),
+            claude_config_lock(),
+            contextlib.ExitStack() as linked_locks,
+        ):
             if linked_adopt:
-                adopt_linked_profile(self, target_account, pre_email, pre_org)
+                # The profile's pair stays held through the activation below.
+                linked_locks.enter_context(
+                    claude_credentials_lock(
+                        config_home=self._session_dir(target_account, pre_email)
+                    )
+                )
+                if adopt_linked_profile(self, target_account, pre_email, pre_org) is None:
+                    raise SwitchError(
+                        f"Account-{target_account} ({pre_email}) has a live "
+                        "session profile ahead of the stored backup, and its "
+                        "credential could not be adopted (unreadable identity "
+                        "or credential). The backup is a consumed generation; "
+                        "nothing was switched."
+                    )
             data = self._get_sequence_data()
             active_account = data.get("activeAccountNumber")
             current_account = str(active_account) if active_account is not None else None
