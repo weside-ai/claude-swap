@@ -29,6 +29,7 @@ SETTINGS_FILENAME = "settings.json"
 AUTOSWITCH_STRATEGIES = (
     "best", "weekly-first", "consume-first", "priority-consume-first",
 )
+AUTO_VIEW_MODES = ("dry-run", "live")
 
 _logger = logging.getLogger("claude-swap")
 
@@ -75,10 +76,18 @@ class AutoSwitchSettings:
 
 @dataclass(frozen=True)
 class UiSettings:
-    """Appearance preferences (``ui`` section). ``theme`` selects the TUI/CLI
-    color theme; ``auto`` follows terminal-background detection."""
+    """TUI preferences (``ui`` section). ``theme`` selects the TUI/CLI
+    color theme; ``auto`` follows terminal-background detection.
+
+    ``auto_view_mode`` is the mode the auto-switch view last ran in
+    (``dry-run`` or ``live``), written by the view itself whenever the mode
+    is chosen and restored when it opens, so restarting the process does not
+    silently stop a rotation that was live. Default dry-run: a view nobody
+    ever took live never starts switching on its own.
+    """
 
     theme: str = "auto"
+    auto_view_mode: str = "dry-run"
 
 
 @dataclass(frozen=True)
@@ -194,6 +203,11 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             help="Color theme; auto follows the terminal background",
         ),
         SettingSpec(
+            "ui", "autoViewMode", "auto_view_mode", "choice",
+            choices=AUTO_VIEW_MODES,
+            help="Mode the TUI auto-switch view opens in (saved when you toggle it)",
+        ),
+        SettingSpec(
             "run", "shareHistory", "share_history", "bool",
             help="cswap run shares chat history unless --no-share-history",
         ),
@@ -307,20 +321,29 @@ def load_settings(backup_root: Path) -> AutoSwitchSettings:
 
 
 def load_ui_settings(backup_root: Path) -> UiSettings:
-    """Load the ui section; missing/corrupt file or unknown theme → default."""
+    """Load the ui section; missing/corrupt file or unknown value → default.
+
+    Each key falls back on its own: a bad theme never resets the auto-view
+    mode, and the other way round.
+    """
     raw = _read_raw(settings_path(backup_root))
     section = raw.get("ui")
     default = UiSettings()
     if not isinstance(section, dict):
         return default
-    theme = section.get("theme", default.theme)
-    if theme not in SETTING_SPECS["ui.theme"].choices:
-        _logger.warning(
-            "settings.json: unsupported ui.theme %r; using %r",
-            theme, default.theme,
-        )
-        return default
-    return UiSettings(theme=theme)
+    values = {}
+    for spec in SETTING_SPECS.values():
+        if spec.section != "ui":
+            continue
+        value = section.get(spec.json_key, spec.default)
+        if value not in spec.choices:
+            _logger.warning(
+                "settings.json: unsupported ui.%s %r; using %r",
+                spec.json_key, value, spec.default,
+            )
+            value = spec.default
+        values[spec.field] = value
+    return UiSettings(**values)
 
 
 def load_run_settings(backup_root: Path) -> RunSettings:

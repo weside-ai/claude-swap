@@ -56,10 +56,15 @@ class CswapApp(App):
         *,
         start: str = "dashboard",
         detected: str | None = None,
+        auto_mode: str | None = None,
     ) -> None:
         super().__init__()
         self.switcher = switcher
-        self._start = start  # "dashboard" | "watch" (`cswap watch`)
+        # "dashboard" | "watch" (`cswap watch`) | "auto" (`cswap auto-view`)
+        self._start = start
+        # `cswap auto-view live|dry-run`: the mode the first auto view opens
+        # in, overriding the saved one. Spent on that first open.
+        self._auto_mode = auto_mode
         self._detected = detected  # terminal background sensed pre-driver, or None
         self.source = SnapshotSource(switcher)
         self._store_only = False
@@ -97,6 +102,8 @@ class CswapApp(App):
         if self._start == "watch":
             # Stacked over the dashboard so Esc lands there, not on exit.
             self.push_screen(WatchScreen())
+        elif self._start == "auto":
+            self.action_open_auto()
         self.set_interval(self.POLL_INTERVAL_S, self._tick)
         self.set_interval(1.0, self._update_refresh_status)
         self._tick()
@@ -402,7 +409,8 @@ class CswapApp(App):
     def action_open_auto(self) -> None:
         if isinstance(self.screen, AutoScreen):
             return
-        self.push_screen(AutoScreen())
+        mode, self._auto_mode = self._auto_mode, None
+        self.push_screen(AutoScreen(mode=mode))
 
     def action_open_watch(self) -> None:
         if isinstance(self.screen, WatchScreen):

@@ -78,6 +78,7 @@ _SUBCOMMAND_FLAGS = {
     "update": "--upgrade",
     "tui": "--tui",
     "watch": "--watch",
+    "auto-view": "--auto-view",
     "menubar": "--menubar",
 }
 
@@ -1279,6 +1280,8 @@ Commands:
   %(prog)s import-usage <path>        adopt usage another machine read (list --json)
   %(prog)s tui                        interactive dashboard (also: bare %(prog)s)
   %(prog)s watch                      dashboard, opened on the live watch page
+  %(prog)s auto-view [live|dry-run]   dashboard, opened on the auto-switch view
+                                     (no mode: the one it last ran in)
   %(prog)s menubar                    macOS menu bar app
   %(prog)s menubar --install-service  keep the menu bar running via launchd
   %(prog)s upgrade                    self-upgrade to latest
@@ -1496,6 +1499,14 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         help=argparse.SUPPRESS,
     )
     group.add_argument(
+        "--auto-view",
+        nargs="?",
+        const="",
+        choices=("", "live", "dry-run"),
+        metavar="live|dry-run",
+        help=argparse.SUPPRESS,
+    )
+    group.add_argument(
         "--menubar",
         action="store_true",
         help=argparse.SUPPRESS,
@@ -1527,6 +1538,7 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         or args.purge
         or args.tui
         or args.watch
+        or args.auto_view is not None
         or args.menubar
         or args.upgrade
         or args.remove_account is not None
@@ -1690,6 +1702,12 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             from claude_swap.tui import run as tui_run
 
             sys.exit(tui_run(switcher, start="watch"))
+        elif args.auto_view is not None:
+            from claude_swap.tui import run as tui_run
+
+            sys.exit(
+                tui_run(switcher, start="auto", auto_mode=args.auto_view or None)
+            )
         elif args.menubar:
             if sys.platform != "darwin":
                 error("The menu bar is only available on macOS.")

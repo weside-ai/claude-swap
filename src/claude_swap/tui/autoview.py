@@ -1,8 +1,13 @@
 """Live auto-switch screen: the real engine, visualized.
 
 Runs :class:`AutoSwitchEngine` in a thread worker and renders its typed
-events. Opens in **dry-run** — opening a view must never start switching
-accounts on its own; going live is an explicit, confirmed action. The
+events. Going live is an explicit, confirmed action; the mode chosen (either
+way) is saved as ``ui.autoViewMode`` and the view reopens in it, so a process
+restart does not silently stop a rotation that was live (2026-11-08: a
+restart left the view in dry-run and nothing rotated until someone pressed
+``l``). A view nobody ever took live opens in **dry-run**. ``cswap auto-view
+live|dry-run`` picks the mode on the command line instead. A start in LIVE is
+the first log line and an INFO line in the log file. The
 engine's own state file semantics (shared cooldown, quarantine list, state
 lock) make it safe to run alongside an external ``cswap auto``.
 
@@ -14,6 +19,7 @@ snapshot poller runs store-only: the engine is the only fetcher.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
@@ -32,7 +38,13 @@ from claude_swap.autoswitch import (
 )
 from claude_swap.lines import binding_window
 from claude_swap.models import AccountsSnapshot
-from claude_swap.settings import SETTING_SPECS, load_settings, parse_model_names
+from claude_swap.settings import (
+    SETTING_SPECS,
+    load_settings,
+    load_ui_settings,
+    parse_model_names,
+    set_setting,
+)
 from claude_swap.tui import data
 from claude_swap.tui.modals import ConfirmModal
 from claude_swap.tui.theme import Palette
@@ -48,6 +60,7 @@ _EVENT_ROLES = {
     "all-exhausted": "sev_crit",
 }
 _QUIET_KINDS = {"poll", "no-switch", "sleep", "account-unquarantined"}
+_logger = logging.getLogger("claude-swap")
 
 
 def event_text(event: AutoSwitchEvent, *, palette: Palette = Palette.DARK) -> Text:
@@ -75,8 +88,11 @@ class AutoScreen(Screen):
 
     app: "CswapApp"
 
-    def __init__(self) -> None:
+    def __init__(self, mode: str | None = None) -> None:
         super().__init__()
+        # "live"/"dry-run" from the command line (`cswap auto-view live`);
+        # None opens in the mode saved by the last toggle.
+        self._mode_override = mode
         self._engine: AutoSwitchEngine | None = None
         self._settings = None
         # Session-only threshold adjustment (t, then arrows). Never written
@@ -115,7 +131,16 @@ class AutoScreen(Screen):
         self._update_summary()
         self.watch(self.app, "snapshot", self._on_snapshot)
         self.watch(self.app, "theme", self._on_theme_change)
-        self._start_engine(dry_run=True)
+        if self._mode_override is not None:
+            mode, origin = self._mode_override, "from the command line"
+            self._save_mode(mode)
+        else:
+            try:
+                mode = load_ui_settings(self.app.switcher.backup_dir).auto_view_mode
+            except Exception:
+                mode = "dry-run"
+            origin = "restored from last session" if mode == "live" else None
+        self._start_engine(dry_run=mode != "live", origin=origin)
 
     def on_unmount(self) -> None:
         if self._engine is not None:
@@ -218,7 +243,7 @@ class AutoScreen(Screen):
 
     # -- engine -------------------------------------------------------------
 
-    def _start_engine(self, *, dry_run: bool) -> None:
+    def _start_engine(self, *, dry_run: bool, origin: str | None = None) -> None:
         engine = AutoSwitchEngine(
             self.app.switcher,
             self._settings,
@@ -236,12 +261,17 @@ class AutoScreen(Screen):
         self._update_badge()
         log = self.query_one("#event-log", RichLog)
         mode = "DRY-RUN (watching only)" if dry_run else "LIVE (will switch accounts)"
+        suffix = f", {origin}" if origin else ""
+        palette = Palette.from_theme(self.app.current_theme)
         log.write(
             Text(
-                f"— engine started: {mode} —",
-                style=Palette.from_theme(self.app.current_theme).muted,
+                f"— engine started: {mode}{suffix} —",
+                # A live start nobody pressed `l` for this session must not
+                # read as background noise.
+                style=palette.muted if dry_run else palette.accent,
             )
         )
+        _logger.info("Auto-switch view: engine started %s%s", mode, suffix)
 
     def _emit_from_thread(self, event: AutoSwitchEvent) -> None:
         """Engine ``on_event`` callback — runs on the worker thread."""
@@ -283,7 +313,18 @@ class AutoScreen(Screen):
     def _restart_engine(self, *, dry_run: bool) -> None:
         if self._engine is not None:
             self._engine.stop()
+        self._save_mode("dry-run" if dry_run else "live")
         self._start_engine(dry_run=dry_run)
+
+    def _save_mode(self, mode: str) -> None:
+        """Remember the mode for the next open; best-effort like the theme."""
+        try:
+            set_setting(self.app.switcher.backup_dir, "ui.autoViewMode", mode)
+        except Exception as exc:  # never crash the view over persistence
+            _logger.warning("Could not save auto-view mode %r: %s", mode, exc)
+            self.app.notify(
+                f"Could not save auto-view mode: {exc}", severity="warning"
+            )
 
     def _update_badge(self) -> None:
         badge = self.query_one("#mode-badge", Static)
