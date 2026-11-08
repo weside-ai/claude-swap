@@ -59,6 +59,7 @@ from claude_swap.models import AccountPolicy
 from claude_swap.poll_policy import (
     ESCALATION_MARGIN_PCT,
     RESET_SLACK_S,
+    SERVE_TTL_S,
     binding_pct,
 )
 from claude_swap.settings import AutoSwitchSettings, atomic_write_json, parse_model_names
@@ -1320,6 +1321,11 @@ class AutoSwitchEngine:
             return TickOutcome.BLOCKED
 
         consume_first = settings.strategy == "consume-first"
+        # A header-probe reading the collector could not freshen this tick is
+        # no evidence of headroom: it is never a target (see
+        # `_distrust_stale_probe_targets`).
+        usage = self._distrust_stale_probe_targets(entries, usage, current)
+        headroom = _headroom_by_account(usage, self._models)
 
         def _rank(**kw):
             """Rank with the no-return bar, and WITHOUT it if that empties AND
@@ -1438,7 +1444,11 @@ class AutoSwitchEngine:
             entries = self.switcher.usage_entries_by_account(
                 fetch={current, *candidates}
             )
-            usage = {num: entry.decision_value() for num, entry in entries.items()}
+            usage = self._distrust_stale_probe_targets(
+                entries,
+                {num: entry.decision_value() for num, entry in entries.items()},
+                current,
+            )
             headroom = _headroom_by_account(usage, self._models)
             active_headroom = headroom.get(current)
             decided_now = self.clock()
@@ -2306,6 +2316,59 @@ class AutoSwitchEngine:
         return [num for _, num in qualifying], any_known, active_reset_ts
 
     # -- adaptive usage scheduling ---------------------------------------------
+
+    def _distrust_stale_probe_targets(
+        self,
+        entries: Mapping[str, object],
+        usage: dict[str, dict | str | None],
+        current: str,
+    ) -> dict[str, dict | str | None]:
+        """Candidates whose header-probe reading is older than ``SERVE_TTL_S``
+        read as unknown for the switch decision.
+
+        A setup-token account's usage only ever comes from the header probe,
+        and its quota is burnt by sessions cswap does not see (its own
+        ``cswap run`` profiles). The store keeps an old reading
+        decision-trusted for up to ``TRUST_MAX_AGE_S`` when a live claim, a
+        future poll plan or a failure state explains the staleness -- right
+        for the active account, wrong for a target: the proactive, at-limit
+        and failover paths have no per-target freshness gate, so a 30-minute
+        old "36%" moved every session onto an account at 112% (2026-11-08).
+
+        The escalation refetch is what freshens a candidate; one it could not
+        refresh (another collector's claim, backoff, hold) is unknown this
+        tick and retried on the next. A fresh refused probe already reads as
+        a 100% ``rejected`` window. The active account is never masked: its
+        own trusted reading still drives the departure decision. Endpoint
+        readings keep the store's trust unchanged.
+        """
+        # Age as of the collection snapshot the store handed over, not a new
+        # clock read: the tick decides on one `now` (see `decided_now`).
+        stale: list[str] = []
+        for num, value in usage.items():
+            if num == current or not isinstance(value, dict):
+                continue
+            if value.get("source") != oauth.USAGE_SOURCE_HEADERS:
+                continue
+            age = getattr(entries.get(num), "age_s", None)
+            if age is not None and age <= SERVE_TTL_S:
+                continue
+            stale.append(num)
+        if not stale:
+            return usage
+        for num in stale:
+            entry = entries.get(num)
+            age = getattr(entry, "age_s", None)
+            _logger.info(
+                "Account %s: header-probe reading %s old could not be "
+                "refreshed this tick; not a switch target",
+                num,
+                "of unknown age" if age is None else f"{age:.0f}s",
+            )
+        masked = dict(usage)
+        for num in stale:
+            masked[num] = None
+        return masked
 
     def _collect_scheduled_usage(
         self,
