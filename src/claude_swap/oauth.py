@@ -7,6 +7,8 @@ import json
 import logging
 import math
 import sys
+import threading
+import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Sequence
@@ -574,6 +576,54 @@ def request_usage_via_probe(access_token: str) -> dict:
         return data
 
 
+# Successful header probes log on INFO so a switch decision can be traced back
+# to the reading it was made on (2026-11-08 01:00:52 could not be). Throttled
+# per account: at most one line a minute while the rounded 5h/7d pct stay the
+# same, at once when they move. context -> (last probe, last logged, pct).
+PROBE_LOG_INTERVAL_S = 60.0
+_probe_log_lock = threading.Lock()
+_probe_log_state: dict[str, tuple[float, float, tuple]] = {}
+
+
+def _reset_probe_log_throttle() -> None:
+    with _probe_log_lock:
+        _probe_log_state.clear()
+
+
+def _window_pct(usage: dict, key: str) -> int | None:
+    window = usage.get(key)
+    pct = window.get("pct") if isinstance(window, dict) else None
+    return None if pct is None else round(pct)
+
+
+def _log_probe_success(context: str, usage: dict) -> None:
+    """INFO line for a successful probe reading, throttled per account."""
+    now = time.monotonic()
+    pcts = (_window_pct(usage, "five_hour"), _window_pct(usage, "seven_day"))
+    with _probe_log_lock:
+        prev = _probe_log_state.get(context)
+        if prev is None:
+            due, age = True, None
+        else:
+            last_probe, last_logged, last_pcts = prev
+            age = now - last_probe
+            due = pcts != last_pcts or now - last_logged >= PROBE_LOG_INTERVAL_S
+        _probe_log_state[context] = (
+            now, now if due else prev[1], pcts
+        )
+    if not due:
+        return
+    labels = " · ".join(
+        f"{name} {'?' if pct is None else f'{pct}%'}"
+        for name, pct in zip(("5h", "7d"), pcts)
+    )
+    _logger.info(
+        "Usage header probe %s: %s (reading fresh; %s)",
+        context, labels,
+        "first probe" if age is None else f"previous probe {age:.0f}s ago",
+    )
+
+
 def _usage_from_probe(access_token: str, context: str) -> "UsageOutcome":
     """Usage from the header probe, classified like an endpoint fetch.
 
@@ -619,6 +669,8 @@ def _usage_from_probe(access_token: str, context: str) -> "UsageOutcome":
         )
         return UsageOutcome(None, error="bad-response")
     usage["source"] = USAGE_SOURCE_HEADERS
+    if "rejected" not in usage:  # a refusal already logged a WARNING
+        _log_probe_success(context, usage)
     return UsageOutcome(usage)
 
 

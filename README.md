@@ -173,6 +173,8 @@ Subfolders inherit the nearest mapped ancestor. In an unmapped directory, `cswap
 
 Run `cswap` on its own (or `cswap tui`) for the full-screen dashboard: live usage for every account, switching, and the auto-switcher, all keyboard-driven. `cswap watch` opens it straight to the live monitor. Works on macOS, Linux, and Windows.
 
+The auto-switch view (`g`) remembers its mode: once you take it live (`l`, confirm), it reopens live after a restart, and back in dry-run once you switch it off. `cswap auto-view` opens the dashboard straight on that view, in the remembered mode; `cswap auto-view live` (or `dry-run`) picks the mode for this start and remembers it, so a terminal multiplexer can start a live rotation with one command. A live start is the first line of the view's log and an INFO line in the log file.
+
 <img src="assets/tui-watch.png" width="760" alt="cswap watch — live 5h/7d usage bars for every account, with reset times and the active account marked">
 
 ### Refresh expired tokens
@@ -213,6 +215,7 @@ cswap unclaimed                 # List stashed credential entries (slot + why th
 cswap unclaimed --purge ID      # Drop one (deletes its bytes; recover with /login + `cswap add`)
 cswap tui                       # Interactive dashboard (also: bare `cswap`)
 cswap watch                     # Dashboard, opened on the live watch page
+cswap auto-view [live|dry-run]  # Dashboard, opened on the auto-switch view (no mode: the last one)
 cswap upgrade                   # Upgrade claude-swap to the latest version
 cswap purge                     # Remove all claude-swap data
 ```
