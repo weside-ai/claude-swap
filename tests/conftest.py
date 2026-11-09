@@ -481,6 +481,8 @@ def _isolate_real_home(request, tmp_path_factory, monkeypatch):
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     monkeypatch.delenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", raising=False)
     monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    # A developer shell may export the fork's opt-in; tests that need it set it.
+    monkeypatch.delenv("CSWAP_LINKED_PROFILES", raising=False)
     # The menu bar's wrapper .app lives in /Applications, outside $HOME, and
     # launch_agent.uninstall() deletes it: on a developer's Mac the real one
     # may be the very app drawing the menu bar while the suite runs.
