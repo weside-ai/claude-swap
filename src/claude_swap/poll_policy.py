@@ -198,6 +198,23 @@ def parse_reset_ts(resets_at: str | None) -> float | None:
         return None
 
 
+def active_in_band(
+    usage: dict | None,
+    models: tuple[str, ...],
+    threshold: float,
+    weekly_threshold: float | None = None,
+) -> bool:
+    """Whether some window sits within ``ESCALATION_MARGIN_PCT`` of its own
+    line while the account still has room (no window at 100%)."""
+    windows = list(oauth.relevant_windows(usage, models))
+    if not windows or any(pct >= 100.0 for _, pct, _ in windows):
+        return False
+    return any(
+        pct >= window_line(label, threshold, weekly_threshold) - ESCALATION_MARGIN_PCT
+        for label, pct, _ in windows
+    )
+
+
 def plan_after_fetch(
     *,
     prev_interval_s: float | None,
@@ -226,6 +243,9 @@ def plan_after_fetch(
     reset (+ ``RESET_SLACK_S``). An at-limit account keeps a bounded slow
     poll instead of sleeping until that reset, so an early provider-side
     quota grant is observed and its decision-grade status stays current.
+    The active account in the band (``active_in_band``) polls at
+    ``URGENT_INTERVAL_S`` when read by the header probe and at most
+    ``MIN_INTERVAL_S`` when read from the endpoint, moving or not.
     """
     default = MIN_INTERVAL_S if is_active else CANDIDATE_DEFAULT_INTERVAL_S
     ceiling = ACTIVE_MAX_INTERVAL_S if is_active else CANDIDATE_MAX_INTERVAL_S
@@ -258,6 +278,20 @@ def plan_after_fetch(
     )
     if is_active and rising_in_band and not recent_429:
         interval = URGENT_INTERVAL_S
+    if is_active and not recent_429 and active_in_band(
+        new_usage, models, threshold, weekly_threshold
+    ):
+        # Near a line the active account is watched whether or not this poll
+        # saw it move: a flat reading says nothing about the next minutes when
+        # many sessions share one login (measured 2026-11-12: 78% -> 95% in
+        # one 285 s gap, the line crossed by 17 points before the next poll).
+        # A header-probe reading is a 1-token inference request, outside the
+        # usage endpoint's ~30/hour budget, so it polls at URGENT_INTERVAL_S;
+        # an endpoint reading keeps the normal floor instead of decaying.
+        if (new_usage or {}).get("source") == oauth.USAGE_SOURCE_HEADERS:
+            interval = URGENT_INTERVAL_S
+        else:
+            interval = min(interval, MIN_INTERVAL_S)
     if recent_429:
         # AIMD additive-increase: grow the interval multiplicatively from the
         # last one toward the wider 429 ceiling, so machines sharing a

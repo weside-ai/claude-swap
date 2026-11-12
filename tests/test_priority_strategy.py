@@ -253,7 +253,9 @@ def test_required_priority_move_skips_stale_targets(
     switch = next(e for e in h.events if isinstance(e, SwitchEvent))
     assert switch.trigger == (
         "failover" if departure == "failover"
-        else "at-limit" if departure == "hard-limit" else "proactive"
+        else "at-limit" if departure == "hard-limit"
+        # A per-account line is hard: reaching it is its own escape trigger.
+        else "hard-line" if departure == "override" else "proactive"
     )
 
 

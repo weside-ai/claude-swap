@@ -5883,16 +5883,29 @@ class ClaudeAccountSwitcher:
         try:
             identities = {number: (email, org_uuid or "")}
             now = self._usage_store.clock()
-            # No models needed: only fetched_at/next_poll_at is read here.
+            # The stored reading and plan of this one slot; models for the band
+            # check come from the poll inputs below.
             entry = self._usage_store.entries(identities).get(number)
             if entry is None or entry.fetched_at is None:
                 return
-            next_poll = max(now, entry.fetched_at + poll_policy.MIN_INTERVAL_S)
+            # A header-probe reading already near a line gets the urgent
+            # cadence the planner gives an active account there
+            # (`poll_policy.plan_after_fetch`), so the first reading after
+            # the switch does not wait the normal floor.
+            threshold, weekly_threshold, models = self._poll_policy_inputs()
+            interval = (
+                poll_policy.URGENT_INTERVAL_S
+                if isinstance(entry.last_good, dict)
+                and entry.last_good.get("source") == oauth.USAGE_SOURCE_HEADERS
+                and poll_policy.active_in_band(
+                    entry.last_good, models, threshold, weekly_threshold
+                )
+                else poll_policy.MIN_INTERVAL_S
+            )
+            next_poll = max(now, entry.fetched_at + interval)
             if entry.next_poll_at is not None and entry.next_poll_at <= next_poll:
                 return
-            self._usage_store.set_poll_plan(
-                {number: (next_poll, poll_policy.MIN_INTERVAL_S)}, identities
-            )
+            self._usage_store.set_poll_plan({number: (next_poll, interval)}, identities)
         except Exception as e:
             self._logger.warning(
                 f"Post-switch poll re-plan failed (switch itself succeeded): {e}"

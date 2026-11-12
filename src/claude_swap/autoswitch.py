@@ -20,7 +20,12 @@ makes the macOS ~30s Keychain cache latency harmless). Candidates must sit
 below every one of their lines and beat the active account by
 ``hysteresis_pct`` points so two accounts hovering at a line never
 ping-pong, and a ``cooldown_seconds`` floor bounds the switch rate (bypassed
-only when the active account is hard at its limit). Physical questions —
+only when the active account is hard at its limit). With no such candidate it
+stays: the global lines are soft and the active runs on to its limit, where
+the at-limit escape may land on an account over a soft line. A per-account
+line is hard: reaching it is an escape of its own (``hard-line``), and no
+trigger ever lands on an account at or over its own line (``_hard_over``).
+Every target needs a reading from this tick. Physical questions —
 exhausted, at its limit, when does quota return — read the raw percentages. Before
 activation the target's token is *freshened* (refreshed if it expires within
 10 minutes — twice Claude Code's refresh buffer, so a running Claude Code's
@@ -604,6 +609,35 @@ class ThresholdMap(dict):
         return self.default
 
 
+def _hard_over(
+    value: dict | str | None,
+    models: tuple[str, ...],
+    num: str,
+    thresholds: Mapping[str, float] | None,
+    weekly_threshold: float | None,
+) -> bool:
+    """Whether ``num`` is at or over its OWN per-account line.
+
+    A per-account line (``cswap threshold``) is a hard limit: auto-switch
+    leaves an account that reaches it at once and never lands on one at or
+    over it, whatever the trigger. The global ``autoswitch.threshold`` and
+    ``weeklyThreshold`` stay soft. The override governs every window, or only
+    the 5-hour one once a weekly line is set (``lines.window_line``), so only
+    those windows are compared here. An account without an override, or with
+    no readable window, is never hard-over.
+    """
+    if thresholds is None or not isinstance(value, dict):
+        return False
+    if num not in thresholds.keys():  # ThresholdMap: keys are the overrides
+        return False
+    line = thresholds[num]
+    return any(
+        pct >= line
+        for label, pct, _ in oauth.relevant_windows(value, models)
+        if weekly_threshold is None or label == oauth.FIVE_HOUR_LABEL
+    )
+
+
 def _every_candidate_above_threshold(
     candidates: Sequence[str],
     over: dict[str, bool | None],
@@ -718,6 +752,9 @@ class AutoSwitchEngine:
         # ``_idle_hold_slow`` is per-tick like ``_blocked_wait_long``.
         self._idle_hold_since: float | None = None
         self._idle_hold_slow = False
+        # The hold `_log_hold` last logged (trigger:account), cleared by a
+        # switch, so an unchanged hold is not logged on every tick.
+        self._hold_logged: str | None = None
         # One-shot typo guard for ``autoswitch.model``: resolved (and possibly
         # warned) on the first tick where every relevant account has readable
         # usage — adaptive polling legitimately leaves gaps before that.
@@ -1203,6 +1240,7 @@ class AutoSwitchEngine:
                 else (100.0 - active_headroom) < thresholds[current]
             )
             if below:
+                self._hold_logged = None  # a later hold is a new one
                 if settings.strategy != "consume-first" and not priority_mode:
                     self._emit(
                         NoSwitchEvent(
@@ -1222,9 +1260,19 @@ class AutoSwitchEngine:
                 # most-perishable quota first. Candidate selection decides whether
                 # a sooner-resetting account with room actually exists.
                 trigger = "priority" if priority_mode else "consume-first"
-            else:
+            elif active_headroom <= 0:
                 # Exhaustion is physical: at-limit reads the raw headroom.
-                trigger = "at-limit" if active_headroom <= 0 else "proactive"
+                trigger = "at-limit"
+            elif _hard_over(
+                usage.get(current), self._models, current, thresholds,
+                settings.weekly_threshold,
+            ):
+                # The account's own line is a hard limit: leave it now, by the
+                # escape rules (no cooldown, no hysteresis margin), and never
+                # land on another account over its own line.
+                trigger = "hard-line"
+            else:
+                trigger = "proactive"
         else:
             if usage.get(current) == USAGE_TOKEN_EXPIRED:
                 # Expired and the refresh could not complete this pass (lock
@@ -1546,6 +1594,23 @@ class AutoSwitchEngine:
             truly_exhausted = all(
                 h is not None and h <= 0 for h in candidate_headrooms
             )
+            self._log_hold(trigger, current, usage.get(current), thresholds[current])
+            if trigger == "hard-line":
+                # Past its owner's limit with nowhere to go. cswap cannot stop
+                # the sessions on the live login; it reports the state on
+                # every tick (BLOCKED, `--once` exit 3) and leaves the moment
+                # any account can take over.
+                self._emit(
+                    NoSwitchEvent(
+                        reason="hard-line-hold",
+                        detail=(
+                            "the active account is at its own line and no "
+                            "account is under its own line (or under its "
+                            "limit without a line of its own)"
+                        ),
+                    )
+                )
+                return TickOutcome.BLOCKED
             if not truly_exhausted:
                 self._emit(
                     NoSwitchEvent(
@@ -1589,6 +1654,7 @@ class AutoSwitchEngine:
             ),
         )
         transient_failure = False
+        stale_skipped = False
         systemic = ""
         for num in ordered:
             email = self.switcher.account_email(num)
@@ -1616,6 +1682,25 @@ class AutoSwitchEngine:
                     if priority_mode and not priority_active_ready:
                         continue
                     return TickOutcome.NO_ACTION
+            elif num in oauth_candidates:
+                # Every other trigger lands only on a reading taken this tick
+                # (no older than SERVE_TTL_S): the escalation refetch freshens
+                # every candidate as the active nears its line, and a reading
+                # it could not refresh (backoff, a concurrent poller's claim)
+                # may be minutes behind sessions that keep burning that
+                # account. An escape slides to the next fresh target instead.
+                entry = entries.get(num)
+                if entry is None or not entry.fresh(self.clock()):
+                    _logger.info(
+                        "Account %s: usage reading %s old was not refreshed "
+                        "this tick; not a switch target",
+                        num,
+                        "of unknown age"
+                        if entry is None or entry.age_s is None
+                        else f"{entry.age_s:.0f}s",
+                    )
+                    stale_skipped = True
+                    continue
             if self.dry_run:
                 # Dry-run stops at the decision: no token refresh, no
                 # quarantine writes — freshening is a mutation.
@@ -1662,8 +1747,59 @@ class AutoSwitchEngine:
                 )
             )
             return TickOutcome.ERROR
+        if stale_skipped:
+            self._emit(
+                NoSwitchEvent(
+                    reason="stale-usage",
+                    detail=(
+                        "no target's usage could be refreshed this tick "
+                        "(backoff or a concurrent poller); retrying"
+                    ),
+                )
+            )
+            return TickOutcome.BLOCKED
         self._emit(NoSwitchEvent(reason="no-viable-target"))
         return TickOutcome.BLOCKED
+
+    def _log_hold(
+        self,
+        trigger: str,
+        current: str,
+        value: dict | str | None,
+        line: float,
+    ) -> None:
+        """Log, once per state, that the engine wanted to leave and stays.
+
+        The engine polls every minute, so the same hold is logged only when
+        its trigger or account changes; a switch, or the active dropping back
+        under its lines, clears it. A hard-line hold
+        is a WARNING: the account is past the limit its owner set and
+        auto-switch cannot take its sessions anywhere else.
+        """
+        key = f"{trigger}:{current}"
+        if key == self._hold_logged:
+            return
+        self._hold_logged = key
+        windows = " · ".join(
+            f"{label} {pct_label(pct)}"
+            for label, pct, _ in oauth.relevant_windows(
+                value if isinstance(value, dict) else None, self._models
+            )
+        ) or "usage unknown"
+        if trigger == "hard-line":
+            _logger.warning(
+                "Account %s is at or over its own line (%s, line %s) and no "
+                "account can take over (none under its own line, or under "
+                "its limit without a line of its own, with a fresh reading); "
+                "staying on it",
+                current, windows, pct_label(line),
+            )
+        else:
+            _logger.info(
+                "Staying on account %s (%s, trigger %s): no candidate "
+                "qualifies with a fresh reading",
+                current, windows, trigger,
+            )
 
     def _no_return_account(
         self,
@@ -2174,15 +2310,13 @@ class AutoSwitchEngine:
             if active_binding is not None
             else active_headroom
         )
-        # When NOTHING is under its lines — the active account and every
-        # candidate each at or over its own switch lines — "land somewhere
-        # healthy" has no answer, and holding out for one costs the user the
-        # session. Sitting still means burning the active account to 100% and
-        # taking a hard limit with a peer that still has room never tried. So
-        # in that state the landing rule is dropped and every strategy ranks
-        # by the most room left before a limit: RAW headroom, `100 - max pct`
-        # over the 5h, 7d and configured per-model windows, whatever lines
-        # they carry.
+        # An ESCAPE (at-limit, failover, hard-line) has to leave, so when
+        # every candidate is at or over its own lines it still lands, on the
+        # one with the most room left before a limit: RAW headroom, `100 -
+        # max pct` over the 5h, 7d and configured per-model windows, whatever
+        # lines they carry. Never on an account over its own per-account line
+        # (`_hard_over`, filtered below). A proactive move never lands over a
+        # line at all: it stays and lets the active run to its limit.
         #
         # Not by soonest reset. Ranking a nearly spent account ahead of one
         # with room because its window rolls over first lands on it at 98-99%,
@@ -2210,14 +2344,12 @@ class AutoSwitchEngine:
         #
         # Deliberately narrow. It engages only when every measured OAuth
         # candidate is at/over its own lines, so a single peer still under
-        # them wins the normal way. A proactive move needs the active over
-        # its lines too; the escapes leave whatever the active reads, and
-        # failover cannot read it at all, so for them the candidates alone
-        # decide.
+        # them wins the normal way.
         over_by_account = {
             num: (b.over if b is not None else None) for num, b in bindings.items()
         }
-        if trigger in ("at-limit", "failover"):
+        escape = trigger in ("at-limit", "failover", "hard-line")
+        if escape:
             all_above = _every_candidate_above_threshold(
                 oauth_candidates, over_by_account
             )
@@ -2245,6 +2377,11 @@ class AutoSwitchEngine:
                 continue  # itself at its limit — never a target
             if num == no_return:
                 continue  # the account we just left; see _no_return_account
+            if _hard_over(
+                usage.get(num), self._models, num, thresholds,
+                settings.weekly_threshold,
+            ):
+                continue  # at/over its own per-account line — a hard limit
             binding = bindings[num]
             # Policy headroom against the candidate's own lines, and whether
             # any of them is reached; raw `h` / the single line when it
@@ -2268,24 +2405,16 @@ class AutoSwitchEngine:
             )
             if trigger in ("proactive", "consume-first"):
                 # Landing must be healthy: an account at/over any of its own
-                # lines would re-trigger on the very next tick. At-limit and
-                # failover are escapes that skip this whole block — any account
-                # with real headroom beats a blocked or dead one.
-                if over and not all_above:
+                # lines would re-trigger on the very next tick, and a move
+                # onto one only spends the next account's reserve early. With
+                # nothing under its lines the engine stays and lets the active
+                # run on to its limit, where the at-limit escape takes over
+                # (the global line is soft: it never stops work, it only
+                # chooses when to leave). At-limit, failover and hard-line are
+                # escapes that skip this whole block.
+                if over:
                     continue
-                if all_above:
-                    # Checked before the strategies, because with nothing under
-                    # its lines the strategy question is moot: consume-first
-                    # exists to spend perishable WEEKLY quota, and every account
-                    # here is about to be blocked on a window. Both strategies
-                    # want the account with the most room, so both take this
-                    # gate and the matching key below. (Ordering matters: `if
-                    # consume_first` catching first filtered on weekly ordering
-                    # while the key sorted on room, two different axes, and
-                    # left consume-first users with no anti-flap guard at all.)
-                    if not _all_above_margin_met(h, active_headroom or 0.0):
-                        continue
-                elif consume_first:
+                if consume_first:
                     # Purely proactive on reset ordering: below the threshold,
                     # only move to accounts whose weekly window resets sooner
                     # than the active one (above the threshold we must move, so
@@ -2336,7 +2465,7 @@ class AutoSwitchEngine:
                 key = (tight, reset_ts if reset_ts is not None else float("inf"), -lh)
             else:
                 key = (-lh,)
-            if trigger in ("at-limit", "failover") and not all_above:
+            if escape and not all_above:
                 # Escapes skip the landing gate on purpose (any account with
                 # real headroom beats a dead one) but must still prefer a target
                 # that can keep working, and one below its lines first: ranking
@@ -2643,6 +2772,7 @@ class AutoSwitchEngine:
             # reader never has to guess.
             state["leftTrigger"] = trigger
             atomic_write_json(self.state_path, state)
+        self._hold_logged = None
 
         self._emit(
             SwitchEvent(
