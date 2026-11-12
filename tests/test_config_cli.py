@@ -10,6 +10,7 @@ from unittest.mock import patch
 import pytest
 
 from claude_swap import cli
+from claude_swap.settings import SETTING_SPECS
 
 
 def _run(argv: list[str], capsys) -> tuple[int, str, str]:
@@ -146,7 +147,7 @@ class TestConfigList:
             },
             {"key": "autoswitch.futureKnob", "suggestion": None},
         ]
-        assert len(payload["settings"]) == 13
+        assert len(payload["settings"]) == len(SETTING_SPECS)
 
 
 class TestConfigSetGet:
