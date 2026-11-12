@@ -941,7 +941,8 @@ def _config_command(argv: list[str]) -> None:
     (same limitation: `config` must be the first argument). Edits
     settings.json in the backup root with strict validation — unlike loading,
     which forgivingly clamps — so a typo'd key or out-of-range value errors
-    loudly here instead of silently degrading at `cswap auto` time.
+    loudly here instead of silently degrading at `cswap auto` time. `list`
+    also names the keys a hand edit left in the file that nothing reads.
     """
     from claude_swap.settings import (
         SETTING_SPECS,
@@ -950,6 +951,7 @@ def _config_command(argv: list[str]) -> None:
         set_setting,
         setting_spec,
         settings_path,
+        unrecognized_keys,
         unset_setting,
     )
 
@@ -1026,6 +1028,7 @@ Examples:
             print(settings_path(root))
         elif action == "list":
             rows = effective_settings(root)
+            ignored = unrecognized_keys(root)
             if json_mode:
                 payload = {
                     "schemaVersion": 1,
@@ -1033,6 +1036,10 @@ Examples:
                     "settings": [
                         {"key": spec.dotted, "value": value, "isSet": is_set}
                         for spec, value, is_set in rows
+                    ],
+                    "unrecognized": [
+                        {"key": item.dotted, "suggestion": item.suggestion}
+                        for item in ignored
                     ],
                 }
                 print(json.dumps(payload, indent=2))
@@ -1042,6 +1049,11 @@ Examples:
                 for spec, value, is_set in rows:
                     line = f"{spec.dotted:<{key_w}}  {format_setting_value(value):<{val_w}}"
                     print(line if is_set else f"{line}  {dimmed('(default)')}")
+                for item in ignored:
+                    warning(
+                        f"Warning: settings.json: {item.describe()}",
+                        file=sys.stderr,
+                    )
         elif action == "get":
             spec = setting_spec(args.key)
             value, is_set = next(
