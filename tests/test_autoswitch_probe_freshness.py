@@ -163,9 +163,9 @@ class TestFreshProbeReadingStillSwitches:
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
 
-    def test_stale_endpoint_reading_is_untouched(self, h):
-        """Scope: only header-probe readings. An endpoint reading keeps the
-        store's decision trust exactly as before."""
+    def test_a_stale_endpoint_reading_is_not_a_target_either(self, h):
+        """Every target needs a reading from this tick: a stale endpoint
+        reading the escalation could not refresh loses to a fresh one."""
         now = h.clock.now
         outcome = h.tick_with_entries({
             "1": _fresh(_usage(95), now),
@@ -173,7 +173,7 @@ class TestFreshProbeReadingStillSwitches:
             "3": _fresh(_usage(60), now),
         })
         assert outcome is TickOutcome.SWITCHED
-        assert h.active_number() == 2
+        assert h.active_number() == 3
 
     def test_stale_probe_on_the_active_account_still_decides_departure(self, h):
         """The gate is about targets. The active account's own trusted

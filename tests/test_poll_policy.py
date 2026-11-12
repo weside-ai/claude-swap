@@ -382,12 +382,14 @@ class TestPerWindowUrgency:
         assert halved == 300.0
 
     def test_a_rise_outside_its_own_band_is_not_urgent(self):
-        # 5h 60 -> 62 is 23 points from its line; the flat 7d max decays.
+        # 5h 60 -> 62 is 23 points from its line: no urgency. The flat 7d
+        # at 94 sits 3 points under its 97 line, so the endpoint-read active
+        # keeps the normal floor instead of decaying.
         assert (
             self._active(
                 _usage7(60, 94), _usage7(62, 94), threshold=85.0, weekly_threshold=97.0
             )
-            == 270.0
+            == poll_policy.MIN_INTERVAL_S
         )
 
     def test_a_window_dropping_into_the_band_is_not_urgent(self):
@@ -401,12 +403,13 @@ class TestPerWindowUrgency:
         # 5h 84 -> 84.1 while the 7d sits at 95.9 under 85/97: by policy the
         # binding window flips to the 5h, but the raw max is flat (decays)
         # and the 5h rose 0.1 (no urgency). Reading the flip as 11.8 points
-        # of movement would halve the interval on nothing.
+        # of movement would halve the interval on nothing. Both windows sit
+        # in the band, so the endpoint-read active holds the normal floor.
         assert (
             self._active(
                 _usage7(84, 95.9), _usage7(84.1, 95.9), threshold=85.0, weekly_threshold=97.0
             )
-            == 270.0
+            == poll_policy.MIN_INTERVAL_S
         )
 
     def test_a_window_present_on_one_side_only_is_ignored(self):

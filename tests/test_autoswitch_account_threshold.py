@@ -220,26 +220,20 @@ class TestLandingGateIsPerCandidate:
         assert outcome is TickOutcome.SWITCHED, _reasons(h)
         assert h.active_number() == 2
 
-    def test_both_over_their_own_lines_hands_the_tick_to_the_all_above_regime(
+    def test_candidates_over_their_own_lines_are_never_landed_on(
         self, temp_home
     ):
-        """Rejecting *every* candidate does not produce NO_ACTION.
+        """Every candidate over its own (hard) line: the engine holds, both
+        proactively at 99% and in the at-limit escape at 100%.
 
-        The landing floor is the exact complement of
-        `_every_account_above_threshold` (see the engine comment at
-        `_left_account_recovered`): if the gate rejects every measured
-        candidate while the active account is over its own line, then by
-        definition every account is at/over its line, `all_above` is True, and
-        the landing gate is bypassed by the all-above room ranking. So the
-        per-account rewrite must feed **both** sides the same map - a version
-        that made the landing gate per-account but left the all-above census on
-        the global scalar would disagree with itself here and hold.
+        The all-above census still reads the per-account map on both sides
+        (`_every_account_above_threshold`); what changed is that no regime
+        lands on an account past its own line.
         """
         h = _fleet(temp_home)
         h.switcher.set_account_threshold("2", 85.0)
         h.switcher.set_account_threshold("3", 85.0)
         h.engine = h._make_engine()
-        # Both candidates are over their own (lowered) lines, and so is 1.
         thresholds = ThresholdMap({"2": 85.0, "3": 85.0}, GLOBAL)
         assert _every_account_above_threshold(
             ["2", "3"],
@@ -247,8 +241,11 @@ class TestLandingGateIsPerCandidate:
             _over(h, 1.0, thresholds["1"]),
         ) is True
         outcome = h.tick_with_usage(self._usage_map())
-        assert outcome is TickOutcome.SWITCHED, _reasons(h)
-        assert h.active_number() != 1
+        assert outcome is TickOutcome.BLOCKED, _reasons(h)
+        assert h.active_number() == 1
+        at_limit = dict(self._usage_map(), **{"1": _usage(100.0)})
+        assert h.tick_with_usage(at_limit) is TickOutcome.BLOCKED
+        assert h.active_number() == 1
 
     def test_the_rejected_candidate_is_not_merely_deprioritized(self, temp_home):
         """A rejected landing spot must be *excluded*, not sorted last.
@@ -1045,32 +1042,32 @@ class TestHysteresisComparesRoomUnderEachAccountsOwnLine:
         outcome = self._tick(h, 60.0, 65.0)
         assert outcome is TickOutcome.SWITCHED, _reasons(h)
         assert h.active_number() == 2
-        assert [e.trigger for e in self._switches(h)] == ["proactive"]
+        # 1 sits on its own line, which is hard: an escape, no margin needed.
+        assert [e.trigger for e in self._switches(h)] == ["hard-line"]
 
     def test_too_little_room_still_refuses(self, temp_home):
-        """1 at 60/60, 2 at 85% on a 90 line: room `15 - 10 = 5`."""
+        """1 at 90% on the (soft) global 90 line, 2 at 85% on a 90 line of
+        its own: room `15 - 10 = 5`."""
         h = _fleet(temp_home)
-        h.switcher.set_account_threshold("1", 60.0)
         h.switcher.set_account_threshold("2", 90.0)
         h.engine = h._make_engine()
-        outcome = self._tick(h, 60.0, 85.0)
+        outcome = self._tick(h, 90.0, 85.0)
         assert outcome is not TickOutcome.SWITCHED
         assert h.active_number() == 1
         assert self._switches(h) == []
 
     def test_room_replaces_raw_headroom_rather_than_relaxing_it(self, temp_home):
-        """1 at 95% on a 95 line, 2 at 80% on an 85 line.
+        """1 at 95% on the (soft) global 90 line, 2 at 82% on an 85 line.
 
-        Raw margin `20 - 5 = 15` would accept; room on the 90 scale is `10`
-        for 1 (exactly on its line) and `10 + 90 * 5 / 85 = 15.29` for 2, a
-        margin of `5.29` that refuses. A gate that takes the looser of the
-        two still switches here.
+        Raw margin `18 - 5 = 13` would accept; room on the 90 scale is
+        `10 * 5 / 10 = 5` for 1 (past its line) and `10 + 90 * 3 / 85 = 13.18`
+        for 2, a margin of `8.18` that refuses. A gate that takes the looser
+        of the two still switches here.
         """
         h = _fleet(temp_home)
-        h.switcher.set_account_threshold("1", 95.0)
         h.switcher.set_account_threshold("2", 85.0)
         h.engine = h._make_engine()
-        outcome = self._tick(h, 95.0, 80.0)
+        outcome = self._tick(h, 95.0, 82.0)
         assert outcome is not TickOutcome.SWITCHED
         assert h.active_number() == 1
         assert self._switches(h) == []
@@ -1093,7 +1090,8 @@ class TestHysteresisComparesRoomUnderEachAccountsOwnLine:
         """Both on an 85 line that is also the global, 1 at 90%, 2 at 80.5%:
         margin 9.5."""
         h = _fleet(temp_home, threshold=85.0)
-        h.switcher.set_account_threshold("1", 85.0)
+        # 1 stays on the global line: a line of its own would be hard and
+        # make this departure an escape, which takes no margin.
         h.switcher.set_account_threshold("2", 85.0)
         h.engine = h._make_engine()
         outcome = self._tick(h, 90.0, 80.5)
@@ -1101,22 +1099,21 @@ class TestHysteresisComparesRoomUnderEachAccountsOwnLine:
         assert h.active_number() == 1
         assert self._switches(h) == []
 
-    def test_equal_lines_off_the_global_are_measured_on_the_global(self, temp_home):
+    def test_past_its_own_line_the_margin_does_not_hold_it(self, temp_home):
         """Both on an 85 line under a 90 global, 1 at 90%, 2 at 80%.
 
-        Room is on the global's scale, so the two lines being equal does not
-        make it raw headroom: 1 is past its line at `10 * 10 / 15 = 6.67`, 2
-        is under it at `10 + 90 * 5 / 85 = 15.29`, a margin of `8.63` that
-        refuses. Raw headroom (`20 - 10 = 10`) would switch.
+        On the global scale the margin is `15.29 - 6.67 = 8.63`, under the
+        10-point bar, which would hold 1 on a soft line. 1's line is its own
+        and hard, so it leaves for 2 (under its own line) at once.
         """
         h = _fleet(temp_home)
         h.switcher.set_account_threshold("1", 85.0)
         h.switcher.set_account_threshold("2", 85.0)
         h.engine = h._make_engine()
         outcome = self._tick(h, 90.0, 80.0)
-        assert outcome is not TickOutcome.SWITCHED
-        assert h.active_number() == 1
-        assert self._switches(h) == []
+        assert outcome is TickOutcome.SWITCHED, _reasons(h)
+        assert h.active_number() == 2
+        assert [e.trigger for e in self._switches(h)] == ["hard-line"]
 
 
 class TestBestRanksByRoomUnderEachAccountsOwnLine:

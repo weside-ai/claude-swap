@@ -13,7 +13,9 @@ Set with `--strategy`, or `cswap config set autoswitch.strategy`.
 
 ## Cooldown and hysteresis
 
-A cooldown (default 5 min) and a hysteresis margin stop it flip-flopping near the threshold: a proactive switch only lands on an account that's below the threshold *and* better than the current one by the margin — a candidate that clears the margin is always taken, but two accounts hovering at the line never ping-pong. When every account is already over its switch lines, it moves to the one with the most quota left before a limit (the lowest usage on its fullest window, whatever line that window carries) under `best`, `weekly-first` and `consume-first` alike, once that account has twice the current one's remaining quota or 3 points more than it, whichever is less. When every account is exhausted it keeps checking on a bounded slow cadence, waking sooner for an imminent reset. `priority-consume-first` does neither: it holds rather than land on an account over its lines (see [Account priority tiers](#account-priority-tiers)).
+A cooldown (default 5 min) and a hysteresis margin stop it flip-flopping near the threshold: a proactive switch only lands on an account that's below every one of its lines *and* better than the current one by the margin — a candidate that clears the margin is always taken, but two accounts hovering at the line never ping-pong. When no candidate is under its lines it stays: the global line is soft, so the active account runs on to its limit, and only the at-limit escape (or failover) then lands on an account over a global line, the one with the most quota left before a limit (the lowest usage on its fullest window). It never lands on an account at or over its own per-account line (see [Per-account threshold](#per-account-threshold)). When every account is exhausted it keeps checking on a bounded slow cadence, waking sooner for an imminent reset. Every hold is logged once in `claude-swap.log`.
+
+Every automatic switch needs a usage reading of the target taken in the same tick (at most 3 minutes old). A candidate whose reading could not be refreshed (backoff, another cswap process holding the fetch) is skipped; with none left it holds and retries next tick.
 
 Under `consume-first` the margin (10 points by default, `autoswitch.hysteresisPct`) is instead the room a landing needs. A move made below the threshold only lands on an account with at least that many points left under every one of its lines, each window against its own line: the cooldown that move starts would otherwise hold it on an account that crosses its line minutes later. Setting the margin to 0 removes that bar. A move forced by the active account's line prefers targets with that room, under `weekly-first` too, and still takes the soonest reset when none has it. An at-limit or failover escape lands on an account below its lines before one over them under every strategy; under `consume-first` it keeps the soonest-reset order only among accounts with that room, and otherwise takes the one with the most quota left.
 
@@ -25,7 +27,13 @@ One threshold compared against the busiest window forces the same number on wind
 
 ## Per-account threshold
 
-`cswap threshold <num|email> <pct>` gives one account its own switch-away line (50–99.9) in place of the global one: auto-switch leaves that account when *its* line is reached and prefers candidates still under *theirs*, with ranking and the hysteresis margin counting room under each account's own line rather than raw headroom. Like the global threshold it is a switch-away line, not a hard cap — with nothing under its line, or the active account at its limit, it still lands somewhere rather than stall (`priority-consume-first` is the exception: it holds, see below). With a weekly line set, the override applies to the 5-hour window only. Accounts without one keep the global threshold. `cswap threshold` alone lists the default and every override, `--unset` clears one, and the [TUI](../README.md#interactive-dashboard-tui) shows a `th 85%` badge.
+`cswap threshold <num|email> <pct>` gives one account its own line (50–99.9) in place of the global one, and that line is **hard**:
+
+- When the active account reaches its own line, auto-switch leaves it at once (trigger `hard-line`): no cooldown and no hysteresis margin. It takes the best account under its lines and, failing that, an account without a line of its own that still has room below its limit, even over the global line.
+- No trigger — proactive, at-limit, failover or hard-line — ever lands on an account at or over its own line.
+- With nowhere to go it holds: each tick reports `hard-line-hold` (`--once` exits `3`), and `claude-swap.log` gets one warning. cswap cannot stop sessions that already run on the live login; it switches away the moment any account can take over.
+
+Ranking and the hysteresis margin count room under each account's own line rather than raw headroom. With a weekly line set, the override applies to the 5-hour window only, and the weekly windows are judged on the soft weekly line. Accounts without one keep the global threshold. `cswap threshold` alone lists the default and every override, `--unset` clears one, and the [TUI](../README.md#interactive-dashboard-tui) shows a `th 85%` badge.
 
 ## Account priority tiers
 
@@ -47,7 +55,7 @@ When the usage API reports no `five_hour` window for an account (verified Ultra 
 
 ## Usage polling
 
-Usage polling is adaptive — a couple of accounts per check, busy alternates watched more closely, and exhausted ones checked about every ten minutes (or slower after 429s) — so API traffic stays flat no matter how many accounts you manage.
+Usage polling is adaptive — a couple of accounts per check, busy alternates watched more closely, and exhausted ones checked about every ten minutes (or slower after 429s) — so API traffic stays flat no matter how many accounts you manage. The active account is watched closely once a window is within 15 points of its line: every minute when its usage comes from the header probe (a 1-token request outside the usage endpoint's hourly budget), every 3 minutes from the usage endpoint, whether or not the last reading moved. A switch onto such an account pulls its next check forward the same way.
 
 ## When something fails
 

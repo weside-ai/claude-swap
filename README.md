@@ -114,12 +114,12 @@ The weekly ones exist because weekly quota left unused at its reset is lost.
 **Per-account controls**
 
 - `cswap disable <num|email>` holds an account out of rotation: auto-switch, bare `cswap switch`, and the `best` / `next-available` strategies skip it until `cswap enable` puts it back. It keeps its login and is still a valid explicit `cswap switch <num|email>` target.
-- `cswap threshold <num|email> <pct>` gives one account its own switch-away line (50–99.9) in place of the global one.
+- `cswap threshold <num|email> <pct>` gives one account its own line (50–99.9) in place of the global one. That line is hard: auto-switch leaves the account as soon as it reaches it and never lands on an account at or over its own line.
 - `cswap priority <num|email> <tier>` ranks accounts for `priority-consume-first`: higher tiers (0–1000, default 0) are used first. The other strategies ignore tiers.
 
 **Good to know**
 
-- **Thresholds are switch-away lines, not hard caps.** With nothing under its line, or the active account at its limit, auto-switch still lands somewhere rather than stall. `priority-consume-first` is the exception: it never lands on an account at or over its line, so it holds and keeps polling.
+- **The global threshold is soft.** At the line auto-switch moves only to an account under its lines; with none, it stays and lets the active account run to its limit, then escapes to the account with the most room. A per-account threshold is hard (above). Manual `cswap switch <num|email>` ignores every line.
 - A cooldown (default 5 min) and a hysteresis margin stop it flip-flopping between accounts near the threshold.
 - `--weekly-threshold 97` gives the 7-day and per-model windows their own line, so the weekly budget can run higher than the 5-hour window. `--threshold`, and any per-account threshold, then governs the 5-hour window only.
 - `--model Fable` folds that model's weekly limit into the decision, for when you hit a per-model limit before the account-wide ones. Names are the per-model rows in `cswap list` (e.g. `Fable: 100%`), matched case-insensitively.
