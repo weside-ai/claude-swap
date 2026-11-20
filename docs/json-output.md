@@ -32,6 +32,17 @@ These apply to `list` rows and the managed active row from `status --json`. All 
 | `loginExpiresAt` | the stored login records when its refresh token expires | ISO-8601 UTC: the moment the slot will need a fresh `/login` and `cswap add --slot N`, so a script can warn a few days ahead instead of discovering `relogin_required`. Absent when Claude Code recorded no such date for that login. |
 | `plan` | the slot's subscription plan has been read from the profile endpoint at least once | `label` as the human views print it (`Ultra`, `Max 5x`, `Pro`, `Team`, `Free`), the raw `tier`, then `organizationType`, `billingType`, `subscriptionStatus` and `planDisplayName` when the profile carried them, `expired` (`true` once the subscription is `canceled` and the account is back on the free tier; the human views show that as a highlighted `Free`) and `fetchedAt`, the last successful profile read. Plans refresh on their own six-hour cadence, not with usage. |
 
+## `cswap list --json --store-only`
+
+`--store-only` reads the stores and nothing else: no network request, no token refresh, no file written (not `cache/usage.json`, not a credential, not the log, no pending one-time migration). It shows what the last ordinary pass left behind, so the payload adds fields that make its age visible:
+
+| Field | Meaning |
+|---|---|
+| `storeOnly` | `true` at the top of the payload. |
+| `storeFetchedAt`, `storeAgeSeconds` | On every row: when the stored measurement was taken and how old it is, whether or not it is still decision-trusted. Both `null` when the store holds no measurement for the account. |
+
+A dead-token strike that an ordinary pass would clear is left in place, and the row shows without `relogin_required`. A slot added before organization support shows an empty organization until an ordinary command migrates it.
+
 ## Pace fields on weekly windows
 
 Weekly windows (`sevenDay` and per-model `scoped` entries, never `fiveHour`) additively carry pace fields once the week is about a day old.

@@ -1495,6 +1495,53 @@ class TestSubcommandAliases:
             show_token_status=False, json_output=True,
         )
 
+    def test_list_store_only_builds_a_read_only_switcher(self):
+        """`cswap list --json --store-only` reads through a read-only switcher
+        and never reaches the update check."""
+        payload = {"schemaVersion": 1, "accounts": [], "storeOnly": True}
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch.object(sys, "argv", ["claude-swap", "list", "--json", "--store-only"]), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch("claude_swap.update_check.check_for_update") as update_check:
+            switcher_cls.return_value.list_accounts.return_value = payload
+            cli.main()
+        switcher_cls.assert_called_once_with(debug=False, read_only=True)
+        switcher_cls.return_value.list_accounts.assert_called_once_with(
+            json_output=True, store_only=True,
+        )
+        update_check.assert_not_called()
+
+    def test_list_store_only_human_view_skips_update_check(self):
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch.object(sys, "argv", ["claude-swap", "list", "--store-only"]), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch("claude_swap.update_check.check_for_update") as update_check:
+            switcher_cls.return_value.list_accounts.return_value = None
+            cli.main()
+        switcher_cls.return_value.list_accounts.assert_called_once_with(
+            json_output=False, store_only=True,
+        )
+        update_check.assert_not_called()
+
+    def test_list_without_store_only_is_unchanged(self):
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch.object(sys, "argv", ["claude-swap", "list", "--json"]), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            switcher_cls.return_value.list_accounts.return_value = {"accounts": []}
+            cli.main()
+        switcher_cls.assert_called_once_with(debug=False)
+
+    @pytest.mark.parametrize("argv, message", [
+        (["cswap", "status", "--store-only"], "--store-only can only be used with 'list'"),
+        (["cswap", "list", "--store-only", "--token-status"],
+         "--store-only cannot be combined with --token-status"),
+    ])
+    def test_store_only_misuse_is_rejected(self, argv, message, capsys):
+        with patch.object(sys, "argv", argv), pytest.raises(SystemExit):
+            cli.main()
+        assert message in capsys.readouterr().err
+
     def test_run_subcommand_still_dispatches(self, tmp_path):
         """`cswap run 2` keeps reaching the session pre-dispatch (not translated)."""
         calls = []

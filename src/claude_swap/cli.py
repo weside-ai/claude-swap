@@ -1534,6 +1534,14 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         ),
     )
     parser.add_argument(
+        "--store-only",
+        action="store_true",
+        help=(
+            "Show only what is already stored (use with 'list'): no network, "
+            "no token refresh, no file written"
+        ),
+    )
+    parser.add_argument(
         "--strategy",
         choices=["best", "next-available"],
         metavar="{best,next-available}",
@@ -1812,6 +1820,12 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     if args.json and not (args.list or args.status or args.switch or args.switch_to):
         parser.error("--json can only be used with 'list', 'status', or 'switch'")
 
+    if args.store_only and not args.list:
+        parser.error("--store-only can only be used with 'list'")
+
+    if args.store_only and args.token_status:
+        parser.error("--store-only cannot be combined with --token-status")
+
     if args.json and args.token_status:
         # Token status is not part of the JSON v1 schema; reject rather than
         # silently ignore it (a future additive field can add it).
@@ -1893,7 +1907,10 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     # serializes it (so no command writes JSON to stdout itself).
     payload: dict | None = None
     try:
-        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        if args.store_only:
+            switcher = ClaudeAccountSwitcher(debug=args.debug, read_only=True)
+        else:
+            switcher = ClaudeAccountSwitcher(debug=args.debug)
 
         # Check for root (unless in container) - POSIX only
         if sys.platform != "win32":
@@ -1915,6 +1932,8 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             switcher.set_account_disabled(args.disable_account, True)
         elif args.enable_account is not None:
             switcher.set_account_disabled(args.enable_account, False)
+        elif args.list and args.store_only:
+            payload = switcher.list_accounts(json_output=args.json, store_only=True)
         elif args.list:
             payload = switcher.list_accounts(
                 show_token_status=args.token_status,
@@ -2034,6 +2053,7 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         not args.purge
         and not args.upgrade
         and not args.json
+        and not args.store_only
         and load_update_settings(paths.get_backup_root()).check
     ):
         from claude_swap.update_check import check_for_update

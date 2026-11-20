@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -19,6 +21,7 @@ from claude_swap.json_output import (
     error_envelope,
     usage_fields,
     usage_to_json,
+    _timestamp,
 )
 from claude_swap.credentials import ActiveCredentials
 from claude_swap.models import Platform
@@ -859,3 +862,208 @@ class TestUsageFromJson:
 
         with pytest.raises(ValueError):
             usage_from_json(usage)
+
+
+# --------------------------------------------------------------------------- #
+# list --store-only: the read-only path
+# --------------------------------------------------------------------------- #
+class TestListStoreOnly:
+    """``list --store-only`` reads the stores and nothing else: no network, no
+    token refresh, no write to any file. Every fake value below is invented."""
+
+    NOW = float(int(time.time()))
+
+    def _reader(self) -> ClaudeAccountSwitcher:
+        switcher = ClaudeAccountSwitcher(read_only=True)
+        switcher._usage_store.clock = lambda: self.NOW
+        return switcher
+
+    @staticmethod
+    def _creds(tag: str, expires_at_ms: int) -> str:
+        return json.dumps({"claudeAiOauth": {
+            "accessToken": f"fake-access-{tag}",
+            "refreshToken": f"fake-refresh-{tag}",
+            "expiresAt": expires_at_ms,
+        }})
+
+    def _seed(self, home: Path) -> ClaudeAccountSwitcher:
+        """Three slots: 1 active with an expired live token and a usage row
+        that also carries token-shaped fields; 2 idle with a dead-token strike
+        bound to another generation (the collector would heal it, a write);
+        3 idle without any usage row. Slot 3 predates org support, so the
+        org-field migration is pending (another write). The migration state
+        file is absent, so the one-time migrations would also write."""
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, {
+            "activeAccountNumber": 1,
+            "lastUpdated": "2024-01-01T00:00:00Z",
+            "sequence": [1, 2, 3],
+            "accounts": {
+                "1": {"email": "a@example.com", "uuid": "uuid-a",
+                      "organizationUuid": "org-a", "organizationName": "A",
+                      "added": "2024-01-01T00:00:00Z"},
+                "2": {"email": "b@example.com", "uuid": "uuid-b",
+                      "organizationUuid": "", "organizationName": "",
+                      "added": "2024-01-01T00:00:00Z"},
+                "3": {"email": "c@example.com", "uuid": "uuid-c",
+                      "added": "2024-01-01T00:00:00Z"},
+            },
+        })
+        (home / ".claude.json").write_text(json.dumps({"oauthAccount": {
+            "emailAddress": "a@example.com", "accountUuid": "uuid-a",
+            "organizationUuid": "org-a", "organizationName": "A",
+        }}))
+        expired = int((self.NOW - 3600) * 1000)
+        valid = int((self.NOW + 3600) * 1000)
+        (home / ".claude" / ".credentials.json").write_text(self._creds("live-a", expired))
+        switcher._write_account_credentials("2", "b@example.com", self._creds("b", valid))
+        switcher._write_account_credentials("3", "c@example.com", self._creds("c", valid))
+        last_good = {"five_hour": {"pct": 42.0, "resets_at": "2027-01-15T10:00:00Z"}}
+        cache = switcher.backup_dir / "cache"
+        cache.mkdir(parents=True, exist_ok=True)
+        (cache / "usage.json").write_text(json.dumps({
+            "schemaVersion": 2,
+            "accounts": {
+                "1": {"email": "a@example.com", "organizationUuid": "org-a",
+                      "fetchedAt": self.NOW - 900, "lastGood": last_good,
+                      "accessToken": "fake-row-access",
+                      "refreshToken": "fake-row-refresh"},
+                "2": {"email": "b@example.com", "organizationUuid": "",
+                      "fetchedAt": self.NOW - 60, "lastGood": last_good,
+                      "authDeadStrikes": 1,
+                      "struckFingerprint": "fp-of-another-generation"},
+            },
+        }))
+        (switcher.backup_dir / ".migrations.json").unlink(missing_ok=True)
+        return switcher
+
+    @staticmethod
+    def _tree(root: Path) -> dict[str, tuple]:
+        out: dict[str, tuple] = {}
+        for path in sorted(root.rglob("*")):
+            st = path.lstat()
+            key = str(path.relative_to(root))
+            if path.is_dir():
+                out[key] = ("dir", st.st_mtime_ns)
+            else:
+                out[key] = ("file", path.read_bytes(), st.st_mtime_ns)
+        return out
+
+    @staticmethod
+    def _forbid(monkeypatch) -> list[str]:
+        """Every network, refresh and credential-write entry point fails and
+        is recorded; callers assert the record is empty, because some call
+        sites (the linked-profile sync) contain any exception."""
+        reached: list[str] = []
+
+        def forbidden(name):
+            def boom(*_a, **_k):
+                reached.append(name)
+                raise AssertionError(f"store-only reached {name}")
+            return boom
+
+        from claude_swap import linked, migrations, subscription
+        from claude_swap.usage_store import UsageStore
+
+        monkeypatch.setattr(
+            "claude_swap.switcher.migrate_legacy_backup_dir",
+            forbidden("migrate_legacy_backup_dir"),
+        )
+        monkeypatch.setattr(
+            migrations, "run_migrations", forbidden("run_migrations")
+        )
+
+        for name in ("try_fetch_usage_for_account", "fetch_usage_for_account",
+                     "fetch_usage", "try_refresh_oauth_credentials",
+                     "refresh_oauth_credentials", "fetch_oauth_profile"):
+            monkeypatch.setattr(oauth, name, forbidden(name))
+        monkeypatch.setattr(subscription, "fetch_plan", forbidden("fetch_plan"))
+        monkeypatch.setattr(
+            linked, "sync_linked_profile", forbidden("sync_linked_profile")
+        )
+        for name in ("_run_usage_fetches", "_fetch_account_usage",
+                     "_fetch_active_usage", "_write_account_credentials",
+                     "_collect_subscription_plans", "_migrate_org_fields"):
+            monkeypatch.setattr(ClaudeAccountSwitcher, name, forbidden(name))
+        # ``reserve`` stays: given no slot it returns before taking the lock.
+        for name in ("_write_rows", "claim", "record", "clear_dead_token"):
+            monkeypatch.setattr(UsageStore, name, forbidden(name))
+        return reached
+
+    @pytest.fixture
+    def seeded(self, temp_home: Path, monkeypatch):
+        monkeypatch.setenv("CSWAP_LINKED_PROFILES", "1")
+        switcher = self._seed(temp_home)
+        return temp_home, switcher
+
+    def test_reaches_no_network_refresh_or_write_function(self, seeded, monkeypatch):
+        _home, _seeder = seeded
+        reached = self._forbid(monkeypatch)
+        payload = self._reader().list_accounts(
+            json_output=True, store_only=True
+        )
+        assert reached == []
+        assert [a["number"] for a in payload["accounts"]] == [1, 2, 3]
+        assert payload["activeAccountNumber"] == 1
+        handlers = logging.getLogger("claude-swap").handlers
+        assert not any(isinstance(h, logging.FileHandler) for h in handlers)
+
+    def test_human_view_reaches_none_either(self, seeded, monkeypatch, capsys):
+        _home, _seeder = seeded
+        reached = self._forbid(monkeypatch)
+        self._reader().list_accounts(store_only=True)
+        assert reached == []
+        out = capsys.readouterr().out
+        assert "a@example.com" in out and "c@example.com" in out
+
+    def test_writes_no_file(self, seeded):
+        home, _seeder = seeded
+        before = self._tree(home)
+        self._reader().list_accounts(
+            json_output=True, store_only=True
+        )
+        self._reader().list_accounts(store_only=True)
+        assert self._tree(home) == before
+
+    def test_rows_carry_store_age_or_null(self, seeded):
+        payload = self._reader().list_accounts(
+            json_output=True, store_only=True
+        )
+        assert payload["storeOnly"] is True
+        rows = {a["number"]: a for a in payload["accounts"]}
+        assert rows[1]["storeFetchedAt"] == _timestamp(self.NOW - 900)
+        assert rows[1]["storeAgeSeconds"] == 900.0
+        assert rows[2]["storeFetchedAt"] == _timestamp(self.NOW - 60)
+        assert rows[2]["storeAgeSeconds"] == 60.0
+        assert rows[3]["storeFetchedAt"] is None
+        assert rows[3]["storeAgeSeconds"] is None
+
+    def test_output_carries_no_token_field(self, seeded):
+        payload = self._reader().list_accounts(
+            json_output=True, store_only=True
+        )
+        text = json.dumps(payload)
+        for needle in ("accessToken", "refreshToken", "fake-"):
+            assert needle not in text
+
+    def test_without_flag_the_pass_still_collects(self, seeded, monkeypatch):
+        """No flag, no change: the same seed goes through the fetch path,
+        heals the strike and carries none of the store-only fields."""
+        _home, _seeder = seeded
+        fetched: list[str] = []
+
+        def fake_fetches(self, infos, pre):
+            fetched.extend(str(i[0]) for i in infos)
+            return {}
+
+        monkeypatch.setattr(ClaudeAccountSwitcher, "_run_usage_fetches", fake_fetches)
+        switcher = ClaudeAccountSwitcher()
+        payload = switcher.list_accounts(json_output=True)
+        assert fetched  # stale slots were eligible
+        assert "storeOnly" not in payload
+        assert all("storeFetchedAt" not in a for a in payload["accounts"])
+        row2 = json.loads(
+            (switcher.backup_dir / "cache" / "usage.json").read_text()
+        )["accounts"]["2"]
+        assert not row2.get("authDeadStrikes")

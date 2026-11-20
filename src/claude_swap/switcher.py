@@ -39,6 +39,7 @@ from claude_swap.json_output import (
     account_ref,
     account_row,
     last_good_usage_fields,
+    store_age_fields,
     usage_failure_fields,
     usage_fields,
     usage_freshness_fields,
@@ -415,7 +416,11 @@ def _same_directory(left: Path, right: Path) -> bool:
 class ClaudeAccountSwitcher:
     """Multi-account switcher for Claude Code."""
 
-    def __init__(self, debug: bool = False):
+    def __init__(self, debug: bool = False, *, read_only: bool = False):
+        """``read_only=True`` builds a switcher for ``list --store-only``: it
+        runs no one-time migration and logs to no file, so constructing it
+        writes nothing. A pending migration waits for the next ordinary
+        command."""
         self.home = Path.home()
         self.platform = Platform.detect()
         self.backup_dir = get_backup_root()
@@ -425,7 +430,7 @@ class ClaudeAccountSwitcher:
         # Migration is a no-op on macOS/Windows where backup_dir already
         # equals the legacy path. MigrationError on a genuine collision
         # propagates as a ClaudeSwitchError and is caught by the CLI.
-        if migrate_legacy_backup_dir(self.backup_dir):
+        if not read_only and migrate_legacy_backup_dir(self.backup_dir):
             legacy = get_legacy_backup_root()
             print(
                 f"claude-swap: migrated data from {legacy} to {self.backup_dir}",
@@ -436,7 +441,9 @@ class ClaudeAccountSwitcher:
         self.configs_dir = self.backup_dir / "configs"
         self.credentials_dir = self.backup_dir / "credentials"
         self.lock_file = self.backup_dir / ".lock"
-        self._logger = setup_logging(self.backup_dir, debug=debug)
+        self._logger = setup_logging(
+            self.backup_dir, debug=debug, to_file=not read_only
+        )
         self._usage_store = UsageStore(self.backup_dir / "cache")
         # (settings mtime, (threshold, weekly_threshold, models)) — see
         # _poll_policy_inputs.
@@ -495,9 +502,10 @@ class ClaudeAccountSwitcher:
         # backup credentials out of Credential Manager into files). Imported
         # lazily to avoid a circular import, and self-contained so it never
         # aborts construction. No-op on fresh installs / once recorded.
-        from claude_swap.migrations import run_migrations
+        if not read_only:
+            from claude_swap.migrations import run_migrations
 
-        run_migrations(self)
+            run_migrations(self)
 
     def _is_running_in_container(self) -> bool:
         """Check if running inside a container."""
@@ -4617,15 +4625,25 @@ class ClaudeAccountSwitcher:
 
         self._prune_mappings(email, account_info.get("organizationUuid", ""))
 
-    def _build_accounts_info(self) -> list[tuple[int, str, str, str, bool, str, str]]:
+    def _build_accounts_info(
+        self, *, read_only: bool = False
+    ) -> list[tuple[int, str, str, str, bool, str, str]]:
         """Build per-account (num, email, org_name, org_uuid, is_active, creds, alias).
 
         Shared by list_accounts and the usage-aware switch helpers so the active
         slot is detected and credentials are read in exactly one place. The
         active account's credentials come from Claude Code's live store; every
         other slot reads its backup copy.
+
+        ``read_only=True`` skips the two steps that write: the org-field
+        migration of ``sequence.json`` and the linked-profile sync (which may
+        refresh a token). A slot the migration has not reached shows an empty
+        organization.
         """
-        data = self._get_sequence_data_migrated() or {}
+        if read_only:
+            data = self._get_sequence_data() or {}
+        else:
+            data = self._get_sequence_data_migrated() or {}
         current_identity = self._get_current_account()
 
         # Find active account number by (email, organizationUuid) composite key
@@ -4634,7 +4652,7 @@ class ClaudeAccountSwitcher:
             current_email, current_org_uuid = current_identity
             active_num = self._find_account_slot(data, current_email, current_org_uuid)
 
-        if active_num is not None:
+        if active_num is not None and not read_only:
             from claude_swap.linked import linked_profiles_enabled, sync_linked_profile
 
             if linked_profiles_enabled():
@@ -5595,8 +5613,15 @@ class ClaudeAccountSwitcher:
         fetch: set[str] | None = None,
         *,
         scheduled: bool = False,
+        read_only: bool = False,
     ) -> dict[str, UsageEntry]:
         """Store-backed usage collection: one :class:`UsageEntry` per account.
+
+        ``read_only=True`` (``list --store-only``) implies an empty ``fetch``
+        and also leaves out the one store write an empty set still makes:
+        clearing a dead-token strike whose generation no stored source holds
+        any more. The row then shows without the "re-login needed" sentinel,
+        as the next ordinary pass would after clearing it.
 
         ``fetch=None`` (on-demand callers: ``--list``/``--status``/switch
         strategies, dashboards) makes every account a candidate but respects
@@ -5613,6 +5638,8 @@ class ClaudeAccountSwitcher:
         (stale-on-error).
         """
         store = self._usage_store
+        if read_only:
+            fetch = set()
         identities = {
             str(num): (email, org_uuid or "")
             for num, email, _org_name, org_uuid, _active, _creds, _alias in accounts_info
@@ -5638,6 +5665,8 @@ class ClaudeAccountSwitcher:
             _i = info_by_num[num]
             if self._entry_token_dead(entry, num, _i[1], _i[5], _i[4]):
                 sentinels[num] = USAGE_RELOGIN_REQUIRED
+            elif read_only:
+                continue
             elif entry.auth_dead_strikes and entry.token_dead():
                 # Struck, but no stored source still matches the condemned
                 # generation — the fingerprint healed the verdict.
@@ -6147,8 +6176,15 @@ class ClaudeAccountSwitcher:
         accounts_info: list[tuple[int, str, str, str, bool, str, str]],
         entries: dict[str, UsageEntry],
         plans: dict[str, dict] | None = None,
+        *,
+        store_only: bool = False,
     ) -> dict:
-        """Build the ``--list --json`` payload from gathered account + usage data."""
+        """Build the ``--list --json`` payload from gathered account + usage data.
+
+        ``store_only`` marks a payload read without any fetch: ``storeOnly``
+        on top, and on every row ``storeFetchedAt``/``storeAgeSeconds``, the
+        age of the stored measurement whatever its trust, null when the store
+        holds none for that slot."""
         active_num: int | None = None
         accounts = []
         seq_data = self._get_sequence_data() or {}
@@ -6161,29 +6197,32 @@ class ClaudeAccountSwitcher:
             # recent enough to act on (≤ STALE_OK_S), else unavailable. Showing
             # older measurements is a human-display affordance only — scripts
             # keying on usageStatus == "ok" must not act on arbitrarily old data.
-            accounts.append(
-                account_row(
-                    num, email, org_name, org_uuid, is_active,
-                    entry.decision_value(),
-                    usage_fetched_at=entry.fetched_at,
-                    usage_age_s=entry.age_s,
-                    last_good_usage=entry.last_good,
-                    last_error=entry.last_error,
-                    backoff_until=(
-                        entry.backoff_until if entry.in_backoff(now) else None
-                    ),
-                    alias=alias,
-                    disabled=self._disabled_from_data(seq_data, str(num)),
-                    policy=self._policy_from_data(seq_data, str(num)),
-                    login_expires_at=oauth.login_expires_at_iso(creds),
-                    subscription_plan=(plans or {}).get(str(num)),
-                )
+            row = account_row(
+                num, email, org_name, org_uuid, is_active,
+                entry.decision_value(),
+                usage_fetched_at=entry.fetched_at,
+                usage_age_s=entry.age_s,
+                last_good_usage=entry.last_good,
+                last_error=entry.last_error,
+                backoff_until=(
+                    entry.backoff_until if entry.in_backoff(now) else None
+                ),
+                alias=alias,
+                disabled=self._disabled_from_data(seq_data, str(num)),
+                policy=self._policy_from_data(seq_data, str(num)),
+                login_expires_at=oauth.login_expires_at_iso(creds),
+                subscription_plan=(plans or {}).get(str(num)),
             )
+            if store_only:
+                row.update(store_age_fields(entry.fetched_at, entry.age_s))
+            accounts.append(row)
         payload = {
             "schemaVersion": SCHEMA_VERSION,
             "activeAccountNumber": active_num,
             "accounts": accounts,
         }
+        if store_only:
+            payload["storeOnly"] = True
         # Additive fields (absent when clean) — never printed warnings; the
         # JSON contract keeps stdout a single machine-readable object.
         dup_warnings = self._duplicate_account_warnings(accounts_info)
@@ -6202,6 +6241,7 @@ class ClaudeAccountSwitcher:
         show_token_status: bool = False,
         json_output: bool = False,
         fetch: set[str] | None = None,
+        store_only: bool = False,
     ) -> dict | None:
         """List all managed accounts.
 
@@ -6211,6 +6251,11 @@ class ClaudeAccountSwitcher:
         ``fetch`` restricts which accounts *may* be fetched this pass (the TUI
         watch view's adaptive set); ``None`` — the CLI default — leaves every
         stale account eligible.
+
+        ``store_only=True`` (``list --store-only``) reads what the stores hold
+        and nothing else: no network, no token refresh, no file write. Pair it
+        with a ``read_only`` switcher, whose construction writes nothing
+        either.
         """
         if not self.sequence_file.exists():
             # JSON mode must never prompt — emit an empty list instead of the
@@ -6225,12 +6270,18 @@ class ClaudeAccountSwitcher:
             self._first_run_setup()
             return None
 
-        accounts_info = self._build_accounts_info()
-        entries = self._collect_usage_entries(accounts_info, fetch=fetch)
+        if store_only:
+            fetch = set()
+        accounts_info = self._build_accounts_info(read_only=store_only)
+        entries = self._collect_usage_entries(
+            accounts_info, fetch=fetch, read_only=store_only
+        )
         plans = self._plans_for_pass(accounts_info, fetch)
 
         if json_output:
-            return self._build_list_payload(accounts_info, entries, plans)
+            return self._build_list_payload(
+                accounts_info, entries, plans, store_only=store_only
+            )
 
         seq_data = self._get_sequence_data() or {}
         print(bolded("Accounts:"))
