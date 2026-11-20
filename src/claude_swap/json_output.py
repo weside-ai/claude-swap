@@ -307,6 +307,19 @@ def usage_freshness_fields(
     return fields
 
 
+def store_age_fields(
+    fetched_at: float | None, age_s: float | None
+) -> dict:
+    """``storeFetchedAt``/``storeAgeSeconds`` for a ``list --store-only`` row:
+    the age of the stored measurement whether or not it is decision-trusted,
+    so a reader that never fetches can see how stale it is. Both are null
+    when the store holds no measurement for the slot."""
+    return {
+        "storeFetchedAt": _timestamp(fetched_at) if fetched_at is not None else None,
+        "storeAgeSeconds": round(age_s, 1) if age_s is not None else None,
+    }
+
+
 def _timestamp(epoch_s: float) -> str:
     return (
         datetime.fromtimestamp(epoch_s, tz=timezone.utc)

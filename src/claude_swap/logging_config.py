@@ -20,7 +20,9 @@ class _LazyDirRotatingFileHandler(RotatingFileHandler):
         return super()._open()
 
 
-def setup_logging(log_dir: Path, debug: bool = False) -> logging.Logger:
+def setup_logging(
+    log_dir: Path, debug: bool = False, *, to_file: bool = True
+) -> logging.Logger:
     """Setup logging with file and optional console output.
 
     The log directory is *not* created eagerly; it materializes on the first
@@ -29,6 +31,8 @@ def setup_logging(log_dir: Path, debug: bool = False) -> logging.Logger:
     Args:
         log_dir: Directory to store log files.
         debug: Enable debug logging to console.
+        to_file: Attach the log file. A read-only switcher passes False, so
+            nothing it logs can write a file.
 
     Returns:
         Configured logger instance.
@@ -41,18 +45,21 @@ def setup_logging(log_dir: Path, debug: bool = False) -> logging.Logger:
 
     # File handler - opens lazily so the dir is only created when something
     # is actually logged.
-    log_file = log_dir / "claude-swap.log"
-    file_handler = _LazyDirRotatingFileHandler(
-        log_file,
-        maxBytes=1024 * 1024,  # 1MB
-        backupCount=3,
-        delay=True,
-    )
-    file_handler.setLevel(logging.DEBUG)
-    file_handler.setFormatter(
-        logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-    )
-    logger.addHandler(file_handler)
+    if to_file:
+        log_file = log_dir / "claude-swap.log"
+        file_handler = _LazyDirRotatingFileHandler(
+            log_file,
+            maxBytes=1024 * 1024,  # 1MB
+            backupCount=3,
+            delay=True,
+        )
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(
+            logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+        )
+        logger.addHandler(file_handler)
+    else:
+        logger.addHandler(logging.NullHandler())
 
     # Console handler for debug mode
     if debug:
