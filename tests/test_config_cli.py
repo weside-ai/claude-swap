@@ -51,13 +51,15 @@ class TestConfigList:
             "autoswitch.unhealthyTicks",
             "autoswitch.model",
             "ui.theme",
+            "ui.orgTag",
             "ui.autoViewMode",
             "run.shareHistory",
             "updates.check",
             "usage.headerProbe",
+            "usage.fableProbe",
         ):
             assert key in out
-        assert out.count("(default)") == 14
+        assert out.count("(default)") == 16
 
     def test_set_key_not_marked_default(self, temp_home, capsys):
         _run(["set", "autoswitch.cooldownSeconds", "600"], capsys)
@@ -84,7 +86,7 @@ class TestConfigList:
         assert payload["schemaVersion"] == 1
         assert payload["path"].endswith("settings.json")
         by_key = {entry["key"]: entry for entry in payload["settings"]}
-        assert len(by_key) == 14
+        assert len(by_key) == 16
         assert by_key["autoswitch.threshold"]["value"] == 90.0
         assert by_key["autoswitch.threshold"]["isSet"] is False
         # An unset weekly line reports null, not the threshold it falls back
@@ -112,11 +114,11 @@ class TestConfigList:
         assert "(default)" in hysteresis_line
         assert "hysteresisPCT" not in out
         assert (
-            "settings.json: autoswitch.hysteresisPCT is not a key this version "
+            "settings.json: 'autoswitch.hysteresisPCT' is not a key this version "
             "reads, so it has no effect; did you mean autoswitch.hysteresisPct?"
         ) in err
         assert (
-            "settings.json: autoswitch.futureKnob is not a key this version "
+            "settings.json: 'autoswitch.futureKnob' is not a key this version "
             "reads, so it has no effect"
         ) in err
         assert "did you mean autoswitch.futureKnob" not in err
@@ -148,6 +150,10 @@ class TestConfigList:
             {"key": "autoswitch.futureKnob", "suggestion": None},
         ]
         assert len(payload["settings"]) == len(SETTING_SPECS)
+        # Reported beside the settings, never as one of them.
+        assert "autoswitch.cooldownSecond" not in {
+            entry["key"] for entry in payload["settings"]
+        }
 
 
 class TestConfigSetGet:
@@ -175,6 +181,17 @@ class TestConfigSetGet:
         assert "= false" in out
         raw = json.loads(_settings_file(capsys).read_text())
         assert raw["autoswitch"]["includeApiKeyAccounts"] is False
+
+    def test_fable_probe_alone_says_it_needs_the_header_probe(
+        self, temp_home, capsys
+    ):
+        code, out, err = _run(["set", "usage.fableProbe", "true"], capsys)
+        assert code == 0
+        assert "usage.fableProbe = true" in out
+        assert "does nothing until usage.headerProbe is true" in err
+        code, _, err = _run(["set", "usage.headerProbe", "true"], capsys)
+        assert code == 0
+        assert err == ""
 
     def test_set_preserves_unknown_keys(self, temp_home, capsys):
         path = _settings_file(capsys)
