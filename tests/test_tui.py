@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import json
+import logging
 import sys
 import threading
 import time
@@ -1524,6 +1525,79 @@ class TestAutoScreen:
             assert fake_engine.instances[0].stopped is True
             assert app._store_only is False
 
+    async def test_back_keeps_a_live_engine_switching(
+        self, tmp_path, fake_engine, caplog
+    ):
+        """Leaving a LIVE view (to the dashboard, say to switch by hand) must
+        not end the rotation: the engine keeps running until the view takes
+        it back or cswap exits."""
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        caplog.set_level(logging.INFO, logger="claude-swap")
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await pilot.press("l")
+            await pilot.pause()
+            await pilot.press("y")
+            await settle(pilot)
+            live = fake_engine.instances[1]
+            await pilot.press("escape")
+            await settle(pilot)
+            from claude_swap.tui.autoview import AutoScreen
+            from claude_swap.tui.dashboard import DashboardScreen
+
+            assert isinstance(app.screen, DashboardScreen)
+            assert live.stopped is False
+            assert app.background_engine is live
+            assert app._store_only is True  # the engine is still the fetcher
+            assert "keeps switching in the background" in caplog.text
+
+            # Reopening takes the running engine back instead of starting one.
+            await pilot.press("g")
+            await settle(pilot)
+            assert isinstance(app.screen, AutoScreen)
+            assert len(fake_engine.instances) == 2
+            assert app.screen._engine is live
+            assert app.background_engine is None
+            assert live.on_event == app.screen._emit_from_thread
+
+            await pilot.press("escape")
+            await settle(pilot)
+            assert live.stopped is False
+            app.exit()
+            await pilot.pause()
+        assert live.stopped is True
+        assert "background LIVE engine stopped (cswap closed)" in caplog.text
+
+    async def test_reopening_in_dry_run_stops_the_background_engine(
+        self, tmp_path, fake_engine
+    ):
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await pilot.press("l")
+            await pilot.pause()
+            await pilot.press("y")
+            await settle(pilot)
+            live = fake_engine.instances[1]
+            await pilot.press("escape")
+            await settle(pilot)
+            assert live.stopped is False
+            from claude_swap.settings import set_setting
+
+            set_setting(tmp_path, "ui.autoViewMode", "dry-run")
+            await pilot.press("g")
+            await settle(pilot)
+            assert live.stopped is True
+            assert app.background_engine is None
+            assert app.screen._engine is fake_engine.instances[2]
+            assert fake_engine.instances[2].dry_run is True
+
     async def test_threshold_adjust_is_session_only(self, tmp_path, fake_engine):
         fake = FakeSwitcher(
             [make_account(1, active=True), make_account(2)], tmp_path
@@ -1556,10 +1630,29 @@ class TestAutoScreen:
             await pilot.pause()
             await pilot.press("y")
             await settle(pilot)
-            assert fake_engine.instances[1].settings.threshold == 93.0
+            live = fake_engine.instances[1]
+            assert live.settings.threshold == 93.0
             await pilot.press("escape")
             await settle(pilot)
-            # leaving the screen reverts the tick and unpins poll planning
+            # leaving the screen reverts the tick, and the live engine that
+            # keeps running goes back to the file value
+            assert app.threshold_pct == 90.0
+            assert live.stopped is False
+            assert live.applied_thresholds[-1] == 90.0
+
+    async def test_leaving_dry_run_unpins_poll_planning(
+        self, tmp_path, fake_engine
+    ):
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await pilot.press("t", "right", "enter")
+            await pilot.pause()
+            await pilot.press("escape")
+            await settle(pilot)
             assert app.threshold_pct == 90.0
             assert fake._poll_inputs_override is None
 

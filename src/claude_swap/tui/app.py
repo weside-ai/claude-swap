@@ -8,6 +8,7 @@ loop never touches file locks, keychain subprocesses, or the network.
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import replace
 from functools import partial
@@ -27,6 +28,8 @@ from claude_swap.tui.dashboard import DashboardScreen, WatchScreen
 from claude_swap.tui.data import ActionResult, SnapshotSource, format_duration, run_action
 from claude_swap.tui.modals import AddTokenModal, ConfirmModal, OutputModal, TokenForm
 from claude_swap.tui.theme import CSWAP_DARK, CSWAP_LIGHT
+
+_logger = logging.getLogger("claude-swap")
 
 
 class CswapApp(App):
@@ -75,6 +78,10 @@ class CswapApp(App):
         self._refresh_generation = 0
         self._applied_generation = 0
         self._last_refresh_error = ""
+        # A LIVE engine whose auto view was left: it keeps switching until
+        # the view takes it back, it fails, or cswap exits (see AutoScreen).
+        self.background_engine = None
+        self.exiting = False
         # The auto-switch lines, drawn as ticks on the status strip's bars
         # everywhere: the threshold on the 5h row, the weekly line (when
         # set) on the 7d and per-model rows. Missing/invalid settings fall
@@ -108,6 +115,35 @@ class CswapApp(App):
         self.set_interval(self.POLL_INTERVAL_S, self._tick)
         self.set_interval(1.0, self._update_refresh_status)
         self._tick()
+
+    # -- background auto-switch engine ---------------------------------------
+
+    def exit(self, *args, **kwargs) -> None:
+        # Set before the screens unmount, so a live auto view stops its
+        # engine instead of handing it to an app that is going away.
+        self.exiting = True
+        self.stop_background_engine()
+        super().exit(*args, **kwargs)
+
+    def on_unmount(self) -> None:
+        self.exiting = True
+        self.stop_background_engine()
+
+    def stop_background_engine(self) -> None:
+        engine, self.background_engine = self.background_engine, None
+        if engine is not None:
+            engine.stop()
+            _logger.info("Auto-switch: background LIVE engine stopped (cswap closed)")
+
+    def background_engine_event(self, event) -> None:
+        """``on_event`` of a background engine — runs on its worker thread.
+        Nothing shows its log; a switch only refreshes the snapshot."""
+        if event.kind != "switch":
+            return
+        try:
+            self.call_from_thread(self.request_refresh)
+        except Exception:
+            pass  # app tearing down
 
     # -- snapshot poll loop ---------------------------------------------------
 
@@ -247,6 +283,8 @@ class CswapApp(App):
             self.busy = False
             self.notify(f"Action failed: {event.worker.error}", severity="error")
         elif event.worker.group == "engine":
+            _logger.error("Auto-switch engine stopped: %s", event.worker.error)
+            self.background_engine = None
             self.notify(
                 f"Auto-switch engine stopped: {event.worker.error}",
                 severity="error",
