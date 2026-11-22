@@ -7,7 +7,14 @@ restart does not silently stop a rotation that was live (2026-11-08: a
 restart left the view in dry-run and nothing rotated until someone pressed
 ``l``). A view nobody ever took live opens in **dry-run**. ``cswap auto-view
 live|dry-run`` picks the mode on the command line instead. A start in LIVE is
-the first log line and an INFO line in the log file. The
+the first log line and an INFO line in the log file.
+
+Leaving the view stops a DRY-RUN engine, but a LIVE one keeps switching in
+the background (``CswapApp.background_engine``) until the view is opened
+again and takes it back, it fails, or cswap exits; each of those writes a
+line to the log file. Stopping it on leave would end the rotation without a
+trace whenever someone steps out to the dashboard, for example to switch by
+hand. While it runs, the snapshot poller stays store-only. The
 engine's own state file semantics (shared cooldown, quarantine list, state
 lock) make it safe to run alongside an external ``cswap auto``.
 
@@ -140,11 +147,22 @@ class AutoScreen(Screen):
             except Exception:
                 mode = "dry-run"
             origin = "restored from last session" if mode == "live" else None
+        background, self.app.background_engine = self.app.background_engine, None
+        if background is not None and mode == "live":
+            self._adopt_engine(background)
+            return
+        if background is not None:
+            background.stop()
+            _logger.info("Auto-switch: background LIVE engine stopped (view reopened in dry-run)")
         self._start_engine(dry_run=mode != "live", origin=origin)
 
     def on_unmount(self) -> None:
-        if self._engine is not None:
-            self._engine.stop()
+        engine = self._engine
+        if engine is not None and not engine.dry_run and not self.app.exiting:
+            self._leave_running(engine)
+            return
+        if engine is not None:
+            engine.stop()
         # A session threshold must not outlive the engine it steered: unpin
         # the poll planner and put the bar tick back on the file value.
         self.app.switcher.clear_poll_policy_inputs()
@@ -251,7 +269,9 @@ class AutoScreen(Screen):
             dry_run=dry_run,
         )
         self._engine = engine
-        self.run_worker(
+        # On the app, not the screen: removing the screen cancels its
+        # workers, and a LIVE engine outlives the view (see _leave_running).
+        self.app.run_worker(
             engine.run_loop,
             thread=True,
             group="engine",
@@ -272,6 +292,34 @@ class AutoScreen(Screen):
             )
         )
         _logger.info("Auto-switch view: engine started %s%s", mode, suffix)
+
+    def _adopt_engine(self, engine: AutoSwitchEngine) -> None:
+        """Take back the LIVE engine the view left running."""
+        self._engine = engine
+        engine.on_event = self._emit_from_thread
+        self._update_badge()
+        palette = Palette.from_theme(self.app.current_theme)
+        self.query_one("#event-log", RichLog).write(
+            Text("— engine still running: LIVE (will switch accounts) —", style=palette.accent)
+        )
+        _logger.info("Auto-switch view: reopened on the running LIVE engine")
+
+    def _leave_running(self, engine: AutoSwitchEngine) -> None:
+        """Leaving the view: the LIVE engine keeps switching in the background.
+
+        A session threshold ends with the view that set it, so the engine
+        goes back to the file value. The poller stays store-only: the engine
+        is still the fetcher."""
+        if self._configured_threshold is not None:
+            if self._settings.threshold != self._configured_threshold:
+                engine.apply_threshold(self._configured_threshold)
+            self.app.threshold_pct = self._configured_threshold
+        engine.on_event = self.app.background_engine_event
+        self.app.background_engine = engine
+        _logger.info(
+            "Auto-switch view closed; the LIVE engine keeps switching in the background"
+        )
+        self.app.notify("Auto-switch keeps running LIVE in the background", timeout=4)
 
     def _emit_from_thread(self, event: AutoSwitchEvent) -> None:
         """Engine ``on_event`` callback — runs on the worker thread."""

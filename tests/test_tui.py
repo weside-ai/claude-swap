@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import json
+import logging
 import sys
 import threading
 import time
@@ -724,6 +725,33 @@ class TestMiniAccountText:
         acc = make_account(1, entry=entry)
         assert "pace" not in mini_account_text(acc, now).plain
 
+    @pytest.mark.parametrize("show", [True, False])
+    def test_org_tag_follows_show_tag(self, show):
+        from claude_swap.tui.widgets import account_card_text, mini_account_text
+
+        acc = dataclasses.replace(make_account(1, active=True), org_name="acme")
+        card = account_card_text(acc, 80, show_tag=show).plain
+        mini = mini_account_text(acc, time.time(), show_tag=show).plain
+        assert ("[acme]" in card) is show
+        assert ("[acme]" in mini) is show
+
+
+class TestOrgTagSetting:
+    @pytest.mark.parametrize(
+        "mode, shown", [("on", (True, True, True)), ("off", (False, False, False))]
+    )
+    def test_org_tag_on_and_off_ignore_email_sharing(self, tmp_path, mode, shown):
+        (tmp_path / "settings.json").write_text(json.dumps({"ui": {"orgTag": mode}}))
+        accounts = [
+            make_account(n, email=email)
+            for n, email in ((1, "dup@example.com"), (2, "dup@example.com"), (3, "solo@example.com"))
+        ]
+        app = make_app(FakeSwitcher(accounts, tmp_path))
+        app.snapshot = AccountsSnapshot(
+            active_number=None, accounts=tuple(accounts), taken_at=time.time()
+        )
+        assert tuple(app.tag_shown(a) for a in accounts) == shown
+
 
 class TestRunAction:
     def test_captures_output_and_payload(self):
@@ -911,6 +939,7 @@ class TestDashboard:
         # org name of "red" makes that literally "[red]" — a valid Rich
         # color markup tag. MenuItem must render it as text, not consume it
         # as styling (which would silently drop the tag from the label).
+        (tmp_path / "settings.json").write_text(json.dumps({"ui": {"orgTag": "on"}}))
         fake = FakeSwitcher(
             [dataclasses.replace(make_account(1, active=True), org_name="red")],
             tmp_path,
@@ -928,6 +957,45 @@ class TestDashboard:
                 item.query_one(Static).render().plain for item in menu.query(MenuItem)
             ]
             assert any("[red]" in label for label in labels)
+
+    async def test_org_tag_auto_tags_only_shared_email_on_every_view(self, tmp_path):
+        from textual.widgets import ListView, Static
+
+        from claude_swap.tui.widgets import AccountCard, AccountsPanel, MenuItem
+
+        accounts = [
+            dataclasses.replace(
+                make_account(n, active=n == 1, email=email), org_name=org
+            )
+            for n, email, org in (
+                (1, "dup@example.com", "orgA"),
+                (2, "dup@example.com", "orgB"),
+                (3, "solo@example.com", "solo"),
+            )
+        ]
+        app = make_app(FakeSwitcher(accounts, tmp_path))
+
+        def tags(text: str) -> set[str]:
+            return {o for o in ("orgA", "orgB", "solo") if f"[{o}]" in text}
+
+        async with app.run_test(size=(100, 32)) as pilot:
+            # Menus entered by action, not keys: one pause instead of five.
+            await app.workers.wait_for_complete(
+                [w for w in app.workers if w.group != "engine"]
+            )
+            assert tags(app.screen.query_one(AccountsPanel).render().plain) == {
+                "orgA", "orgB"
+            }
+            await app.screen._dispatch("remove-menu")
+            menu = app.screen.query_one("#menu", ListView)
+            labels = " ".join(
+                item.query_one(Static).render().plain for item in menu.query(MenuItem)
+            )
+            assert tags(labels) == {"orgA", "orgB"}
+            app.screen.action_open_switch()
+            await pilot.pause()
+            cards = " ".join(c.render().plain for c in app.screen.query(AccountCard))
+            assert tags(cards) == {"orgA", "orgB"}
 
     async def test_back_menu_entry_pops_submenu(self, tmp_path):
         fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
@@ -1457,6 +1525,79 @@ class TestAutoScreen:
             assert fake_engine.instances[0].stopped is True
             assert app._store_only is False
 
+    async def test_back_keeps_a_live_engine_switching(
+        self, tmp_path, fake_engine, caplog
+    ):
+        """Leaving a LIVE view (to the dashboard, say to switch by hand) must
+        not end the rotation: the engine keeps running until the view takes
+        it back or cswap exits."""
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        caplog.set_level(logging.INFO, logger="claude-swap")
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await pilot.press("l")
+            await pilot.pause()
+            await pilot.press("y")
+            await settle(pilot)
+            live = fake_engine.instances[1]
+            await pilot.press("escape")
+            await settle(pilot)
+            from claude_swap.tui.autoview import AutoScreen
+            from claude_swap.tui.dashboard import DashboardScreen
+
+            assert isinstance(app.screen, DashboardScreen)
+            assert live.stopped is False
+            assert app.background_engine is live
+            assert app._store_only is True  # the engine is still the fetcher
+            assert "keeps switching in the background" in caplog.text
+
+            # Reopening takes the running engine back instead of starting one.
+            await pilot.press("g")
+            await settle(pilot)
+            assert isinstance(app.screen, AutoScreen)
+            assert len(fake_engine.instances) == 2
+            assert app.screen._engine is live
+            assert app.background_engine is None
+            assert live.on_event == app.screen._emit_from_thread
+
+            await pilot.press("escape")
+            await settle(pilot)
+            assert live.stopped is False
+            app.exit()
+            await pilot.pause()
+        assert live.stopped is True
+        assert "background LIVE engine stopped (cswap closed)" in caplog.text
+
+    async def test_reopening_in_dry_run_stops_the_background_engine(
+        self, tmp_path, fake_engine
+    ):
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await pilot.press("l")
+            await pilot.pause()
+            await pilot.press("y")
+            await settle(pilot)
+            live = fake_engine.instances[1]
+            await pilot.press("escape")
+            await settle(pilot)
+            assert live.stopped is False
+            from claude_swap.settings import set_setting
+
+            set_setting(tmp_path, "ui.autoViewMode", "dry-run")
+            await pilot.press("g")
+            await settle(pilot)
+            assert live.stopped is True
+            assert app.background_engine is None
+            assert app.screen._engine is fake_engine.instances[2]
+            assert fake_engine.instances[2].dry_run is True
+
     async def test_threshold_adjust_is_session_only(self, tmp_path, fake_engine):
         fake = FakeSwitcher(
             [make_account(1, active=True), make_account(2)], tmp_path
@@ -1489,10 +1630,29 @@ class TestAutoScreen:
             await pilot.pause()
             await pilot.press("y")
             await settle(pilot)
-            assert fake_engine.instances[1].settings.threshold == 93.0
+            live = fake_engine.instances[1]
+            assert live.settings.threshold == 93.0
             await pilot.press("escape")
             await settle(pilot)
-            # leaving the screen reverts the tick and unpins poll planning
+            # leaving the screen reverts the tick, and the live engine that
+            # keeps running goes back to the file value
+            assert app.threshold_pct == 90.0
+            assert live.stopped is False
+            assert live.applied_thresholds[-1] == 90.0
+
+    async def test_leaving_dry_run_unpins_poll_planning(
+        self, tmp_path, fake_engine
+    ):
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await pilot.press("t", "right", "enter")
+            await pilot.pause()
+            await pilot.press("escape")
+            await settle(pilot)
             assert app.threshold_pct == 90.0
             assert fake._poll_inputs_override is None
 

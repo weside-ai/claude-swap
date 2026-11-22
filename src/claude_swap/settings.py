@@ -82,8 +82,10 @@ class AutoSwitchSettings:
 
 @dataclass(frozen=True)
 class UiSettings:
-    """TUI preferences (``ui`` section). ``theme`` selects the TUI/CLI
-    color theme; ``auto`` follows terminal-background detection.
+    """Appearance preferences (``ui`` section). ``theme`` selects the TUI/CLI
+    color theme; ``auto`` follows terminal-background detection. ``org_tag``
+    picks when listings draw the ``[org]`` tag: ``on``, ``off``, or ``auto``
+    (only on accounts sharing an email with another managed account).
 
     ``auto_view_mode`` is the mode the auto-switch view last ran in
     (``dry-run`` or ``live``), written by the view itself whenever the mode
@@ -93,6 +95,7 @@ class UiSettings:
     """
 
     theme: str = "auto"
+    org_tag: str = "auto"
     auto_view_mode: str = "dry-run"
 
 
@@ -126,9 +129,16 @@ class UsageSettings:
     headers of a 1-output-token Haiku request instead. Each probe is a real,
     if tiny, request against that account's quota, sent at the normal poll
     cadence, so it is opt-in; off leaves such accounts at "usage unavailable".
+
+    ``fable_probe``: those headers report Fable's weekly limit only on a
+    Fable response, so also send a 1-output-token Fable request per poll and
+    show its row. A second opt-in because it spends Fable quota, which
+    agreeing to a Haiku token did not cover. It acts only with
+    ``header_probe`` on.
     """
 
     header_probe: bool = False
+    fable_probe: bool = False
 
 
 _SECTION_DEFAULT_SOURCES = {
@@ -214,6 +224,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             help="Color theme; auto follows the terminal background",
         ),
         SettingSpec(
+            "ui", "orgTag", "org_tag", "choice", choices=("auto", "on", "off"),
+            help="Show the [org] tag beside accounts; auto only where accounts share an email",
+        ),
+        SettingSpec(
             "ui", "autoViewMode", "auto_view_mode", "choice",
             choices=AUTO_VIEW_MODES,
             help="Mode the TUI auto-switch view opens in (saved when you toggle it)",
@@ -229,6 +243,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "usage", "headerProbe", "header_probe", "bool",
             help="Read setup-token usage from a 1-token Haiku request's rate-limit headers (opt-in: uses quota)",
+        ),
+        SettingSpec(
+            "usage", "fableProbe", "fable_probe", "bool",
+            help="With usage.headerProbe, also read Fable's weekly limit from a 1-token Fable request (opt-in: uses Fable quota)",
         ),
     )
 }
@@ -249,10 +267,16 @@ _SECTION_KEYS: dict[str, tuple[str, ...]] = {
 }
 
 # How alike two names must be (difflib ratio, compared without case) before
-# one is offered as the spelling the other meant. 0.75 covers a wrong case, a
-# dropped or doubled letter and a missing suffix ("hysteresis"), and stays
-# clear of unrelated keys that merely share a word ("graceSeconds").
-_TYPO_CUTOFF = 0.75
+# one is offered as the spelling the other meant. 0.9 admits one wrong,
+# missing or extra character in all but the shortest names, and another word
+# separator ("weekly_threshold"). A name that only shares a word with a real
+# key ("maxThreshold", "holdSeconds") scores below it.
+_TYPO_CUTOFF = 0.9
+
+# A shortened name scores too low for that and is matched as a prefix:
+# "interval" and "cooldown", which are `cswap auto` flag names, for
+# intervalSeconds and cooldownSeconds. Shorter than this is not a name.
+_PREFIX_MIN_LENGTH = 3
 
 
 @dataclass(frozen=True)
@@ -262,15 +286,25 @@ class UnrecognizedKey:
     ``dotted`` is ``section.key`` for a key inside a known section and the
     bare name for a top-level key that is not a section. ``suggestion`` is
     the valid name it most resembles, when one is close enough to be a typo.
+    The two are equal for a setting written flat at the top level
+    (``"autoswitch.threshold": 80``): the right name in the wrong place.
     """
 
     dotted: str
     suggestion: str | None = None
 
     def describe(self) -> str:
-        hint = f"; did you mean {self.suggestion}?" if self.suggestion else ""
+        # The key is the file's own text, so it is quoted: a stray space or a
+        # newline in it stays visible and on one line.
+        if self.suggestion is None:
+            hint = ""
+        elif self.suggestion == self.dotted:
+            section, _, key = self.dotted.partition(".")
+            hint = f"; it belongs inside {section!r} as {key!r}"
+        else:
+            hint = f"; did you mean {self.suggestion}?"
         return (
-            f"{self.dotted} is not a key this version reads, "
+            f"{self.dotted!r} is not a key this version reads, "
             f"so it has no effect{hint}"
         )
 
@@ -365,11 +399,15 @@ def _read_raw(path: Path) -> dict:
 
 
 def _nearest(name: str, valid: tuple[str, ...]) -> str | None:
-    """The valid name ``name`` most resembles, or None when none is close."""
+    """The valid name ``name`` most resembles, or None when none is close:
+    the only one it is a prefix of, else the nearest spelling."""
     by_lower = {v.lower(): v for v in valid}
-    close = difflib.get_close_matches(
-        name.lower(), by_lower, n=1, cutoff=_TYPO_CUTOFF
-    )
+    lowered = name.lower()
+    if len(lowered) >= _PREFIX_MIN_LENGTH:
+        longer = [v for low, v in by_lower.items() if low.startswith(lowered)]
+        if len(longer) == 1:
+            return longer[0]
+    close = difflib.get_close_matches(lowered, by_lower, n=1, cutoff=_TYPO_CUTOFF)
     return by_lower[close[0]] if close else None
 
 
@@ -381,7 +419,12 @@ def _unrecognized(raw: dict) -> list[UnrecognizedKey]:
             continue
         known = _SECTION_KEYS.get(name)
         if known is None:
-            found.append(UnrecognizedKey(name, _nearest(name, tuple(_SECTION_KEYS))))
+            # A dotted setting name here is the spelling `cswap config`
+            # prints, written as one flat key.
+            flat = name if name in SETTING_SPECS else None
+            found.append(
+                UnrecognizedKey(name, flat or _nearest(name, tuple(_SECTION_KEYS)))
+            )
         elif isinstance(value, dict):
             for key in value:
                 if key not in known:
@@ -431,7 +474,7 @@ def load_settings(backup_root: Path) -> AutoSwitchSettings:
 
 
 def load_ui_settings(backup_root: Path) -> UiSettings:
-    """Load the ui section; missing/corrupt file or unknown value → default.
+    """Load the ui section; missing/corrupt file or a bad value → its default.
 
     Each key falls back on its own: a bad theme never resets the auto-view
     mode, and the other way round.
@@ -448,8 +491,8 @@ def load_ui_settings(backup_root: Path) -> UiSettings:
         value = section.get(spec.json_key, spec.default)
         if value not in spec.choices:
             _logger.warning(
-                "settings.json: unsupported ui.%s %r; using %r",
-                spec.json_key, value, spec.default,
+                "settings.json: unsupported %s %r; using %r",
+                spec.dotted, value, spec.default,
             )
             value = spec.default
         values[spec.field] = value
@@ -494,20 +537,28 @@ def load_update_settings(backup_root: Path) -> UpdateSettings:
 
 
 def load_usage_settings(backup_root: Path) -> UsageSettings:
-    """Load the usage section; missing/corrupt file or non-bool → default."""
+    """Load the usage section; missing/corrupt file → defaults, and a
+    non-bool value → that key's default."""
     raw = _read_raw(settings_path(backup_root))
     section = raw.get("usage")
     default = UsageSettings()
     if not isinstance(section, dict):
         return default
-    header_probe = section.get("headerProbe", default.header_probe)
-    if not isinstance(header_probe, bool):
-        _logger.warning(
-            "settings.json: usage.headerProbe must be true or false, got %r; "
-            "using %r", header_probe, default.header_probe,
-        )
-        return default
-    return UsageSettings(header_probe=header_probe)
+    values: dict[str, bool] = {}
+    for spec in SETTING_SPECS.values():  # every usage key is a boolean
+        if spec.section != "usage":
+            continue
+        field, json_key = spec.field, spec.json_key
+        fallback = getattr(default, field)
+        value = section.get(json_key, fallback)
+        if not isinstance(value, bool):
+            _logger.warning(
+                "settings.json: usage.%s must be true or false, got %r; "
+                "using %r", json_key, value, fallback,
+            )
+            value = fallback
+        values[field] = value
+    return UsageSettings(**values)
 
 
 def save_settings(backup_root: Path, settings: AutoSwitchSettings) -> None:

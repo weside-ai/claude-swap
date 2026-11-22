@@ -8,6 +8,7 @@ loop never touches file locks, keychain subprocesses, or the network.
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import replace
 from functools import partial
@@ -18,7 +19,7 @@ from textual.reactive import reactive
 from textual.worker import WorkerState
 
 from claude_swap import printer
-from claude_swap.models import AccountsSnapshot
+from claude_swap.models import AccountSnapshot, AccountsSnapshot, org_tag_shown
 from claude_swap.snapshot_source import account_identity
 from claude_swap.settings import load_settings, load_ui_settings, set_setting
 from claude_swap.switcher import ClaudeAccountSwitcher
@@ -27,6 +28,8 @@ from claude_swap.tui.dashboard import DashboardScreen, WatchScreen
 from claude_swap.tui.data import ActionResult, SnapshotSource, format_duration, run_action
 from claude_swap.tui.modals import AddTokenModal, ConfirmModal, OutputModal, TokenForm
 from claude_swap.tui.theme import CSWAP_DARK, CSWAP_LIGHT
+
+_logger = logging.getLogger("claude-swap")
 
 
 class CswapApp(App):
@@ -75,6 +78,10 @@ class CswapApp(App):
         self._refresh_generation = 0
         self._applied_generation = 0
         self._last_refresh_error = ""
+        # A LIVE engine whose auto view was left: it keeps switching until
+        # the view takes it back, it fails, or cswap exits (see AutoScreen).
+        self.background_engine = None
+        self.exiting = False
         # The auto-switch lines, drawn as ticks on the status strip's bars
         # everywhere: the threshold on the 5h row, the weekly line (when
         # set) on the 7d and per-model rows. Missing/invalid settings fall
@@ -87,9 +94,10 @@ class CswapApp(App):
             self.threshold_pct = None
             self.weekly_threshold_pct = None
         try:
-            self._theme_name = load_ui_settings(switcher.backup_dir).theme
+            ui = load_ui_settings(switcher.backup_dir)
+            self._theme_name, self.org_tag = ui.theme, ui.org_tag
         except Exception:
-            self._theme_name = "auto"
+            self._theme_name, self.org_tag = "auto", "auto"
 
     def on_mount(self) -> None:
         self.register_theme(CSWAP_DARK)
@@ -107,6 +115,35 @@ class CswapApp(App):
         self.set_interval(self.POLL_INTERVAL_S, self._tick)
         self.set_interval(1.0, self._update_refresh_status)
         self._tick()
+
+    # -- background auto-switch engine ---------------------------------------
+
+    def exit(self, *args, **kwargs) -> None:
+        # Set before the screens unmount, so a live auto view stops its
+        # engine instead of handing it to an app that is going away.
+        self.exiting = True
+        self.stop_background_engine()
+        super().exit(*args, **kwargs)
+
+    def on_unmount(self) -> None:
+        self.exiting = True
+        self.stop_background_engine()
+
+    def stop_background_engine(self) -> None:
+        engine, self.background_engine = self.background_engine, None
+        if engine is not None:
+            engine.stop()
+            _logger.info("Auto-switch: background LIVE engine stopped (cswap closed)")
+
+    def background_engine_event(self, event) -> None:
+        """``on_event`` of a background engine — runs on its worker thread.
+        Nothing shows its log; a switch only refreshes the snapshot."""
+        if event.kind != "switch":
+            return
+        try:
+            self.call_from_thread(self.request_refresh)
+        except Exception:
+            pass  # app tearing down
 
     # -- snapshot poll loop ---------------------------------------------------
 
@@ -246,6 +283,8 @@ class CswapApp(App):
             self.busy = False
             self.notify(f"Action failed: {event.worker.error}", severity="error")
         elif event.worker.group == "engine":
+            _logger.error("Auto-switch engine stopped: %s", event.worker.error)
+            self.background_engine = None
             self.notify(
                 f"Auto-switch engine stopped: {event.worker.error}",
                 severity="error",
@@ -416,6 +455,11 @@ class CswapApp(App):
         if isinstance(self.screen, WatchScreen):
             return
         self.push_screen(WatchScreen())
+
+    def tag_shown(self, acc: AccountSnapshot) -> bool:
+        """Whether ``ui.orgTag`` draws ``acc``'s org tag in any TUI account view."""
+        accounts = self.snapshot.accounts if self.snapshot else ()
+        return org_tag_shown(self.org_tag, acc.email, [a.email for a in accounts])
 
     # -- theme --------------------------------------------------------------
 

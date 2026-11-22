@@ -2275,8 +2275,12 @@ class TestRunLoop:
              caplog.at_level(logging.WARNING, logger="claude-swap"):
             assert harness.engine.run_loop() == 0
         assert len(ticks) == 3
-        assert [r.getMessage() for r in caplog.records] == [
-            "settings.json: autoswitch.hysteresisPCT is not a key this version "
+        assert [
+            message
+            for message in (r.getMessage() for r in caplog.records)
+            if message.startswith("settings.json:")
+        ] == [
+            "settings.json: 'autoswitch.hysteresisPCT' is not a key this version "
             "reads, so it has no effect; did you mean autoswitch.hysteresisPct?"
         ]
 
@@ -5678,6 +5682,25 @@ class TestFreshenRoutesThroughGate:
             f"got {status!r}: lock contention falls into the transient bucket "
             "and reads as (network?)"
         )
+
+    def test_a_candidate_holding_the_live_grant_is_passed_over(
+        self, temp_home
+    ):
+        """The gate leaves a grant the live login holds to Claude Code (#590).
+
+        That is neither network trouble nor a dead token, so the candidate is
+        skipped for the tick without an error and without a quarantine.
+        """
+        from claude_swap import oauth as oauth_mod
+
+        harness = EngineHarness(temp_home)
+        harness.seed(2, "b@example.com", expires_at=1)
+        with patch.object(
+            harness.switcher, "consume_backup_grant",
+            return_value=oauth_mod.RefreshOutcome(None, "live-login"),
+        ):
+            status = harness.engine._freshen_target("2", "b@example.com")
+        assert status == "skip-live-login"
 
     def test_invalid_client_is_not_reported_as_network_trouble(
         self, temp_home
